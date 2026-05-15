@@ -1,0 +1,15 @@
+venv/
+backend/venv/
+frontend/node_modules/
+.env
+*.pyc
+__pycache__/
+.DS_Store
+/.idea
+.vscode
+.pytest_cache
+dist/
+build/
+coverage/
+*.egg-info/
+*.sqlite3
