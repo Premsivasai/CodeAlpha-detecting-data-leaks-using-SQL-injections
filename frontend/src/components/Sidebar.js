@@ -17,6 +17,7 @@ const Sidebar = () => {
     { to: '/attacks', icon: ShieldAlert, label: 'Attack Logs' },
     { to: '/security', icon: BarChart3, label: 'Security Stats' },
     { to: '/alerts', icon: Bell, label: 'Alerts' },
+    { to: '/activity', icon: Activity, label: 'Activity' },
     { to: '/ai-predictions', icon: Brain, label: 'AI Predictions' },
     { to: '/ip-blocking', icon: Ban, label: 'IP Blocking' },
     { to: '/capabilities', icon: Key, label: 'Capabilities' },

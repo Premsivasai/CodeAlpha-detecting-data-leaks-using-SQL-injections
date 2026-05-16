@@ -200,9 +200,32 @@ class Notification(Base):
     message = Column(Text, nullable=False)
     notification_type = Column(String(50), default="info")
     is_read = Column(Boolean, default=False)
+    delivery_status = Column(String(50), default="pending")
+    delivery_target = Column(String(255), nullable=True)
+    delivery_attempts = Column(Integer, default=0)
+    last_delivery_error = Column(Text, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    next_retry_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now())
 
     user = relationship("User")
+
+
+class NotificationDeliveryAttempt(Base):
+    __tablename__ = "notification_delivery_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    notification_id = Column(Integer, ForeignKey("notifications.id"), nullable=False)
+    target = Column(String(255), nullable=True)
+    attempt_number = Column(Integer, nullable=False, default=1)
+    status = Column(String(50), nullable=False, default="pending")
+    error_message = Column(Text, nullable=True)
+    response_code = Column(Integer, nullable=True)
+    next_attempt_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+    notification = relationship("Notification")
 
 
 class SecurityMetric(Base):
@@ -233,3 +256,19 @@ class Permission(Base):
     resource = Column(String(50), nullable=False)
     action = Column(String(50), nullable=False)
     created_at = Column(DateTime, default=func.now())
+
+
+class Incident(Base):
+    __tablename__ = "incidents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    severity = Column(String(20), nullable=False, default="medium")
+    status = Column(String(50), default="open")
+    meta = Column(JSON, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    reporter = relationship("User")

@@ -1,7 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, and_
+from sqlalchemy import select, desc, and_, or_
+from hashlib import sha256
 from app.models import (
     AttackLog, QueryLog, EncryptionLog, FailedLoginAttempt,
     AuditLog, Notification, SecurityMetric, SystemAlert, BlockedIP
@@ -10,6 +11,144 @@ import json
 
 
 class LogService:
+    @staticmethod
+    def _severity_rank(severity: Optional[str]) -> int:
+        order = {
+            'low': 1,
+            'medium': 2,
+            'high': 3,
+            'critical': 4,
+        }
+        return order.get((severity or 'medium').lower(), 2)
+
+    @staticmethod
+    def _build_incident_fingerprint(ip_address: str, attack_type: str, target: Optional[str], detection_method: Optional[str]) -> str:
+        source = f"{ip_address}|{attack_type}|{target or ''}|{detection_method or ''}".lower().strip()
+        return sha256(source.encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _normalize_incident_meta(meta: Optional[dict]) -> dict:
+        normalized = dict(meta or {})
+        normalized.setdefault('attack_ids', [])
+        normalized.setdefault('event_count', 0)
+        return normalized
+
+    @staticmethod
+    async def correlate_incident(db: AsyncSession, attack_log: AttackLog):
+        from app.models import Incident
+
+        fingerprint = LogService._build_incident_fingerprint(
+            attack_log.ip_address,
+            attack_log.attack_type,
+            attack_log.target,
+            attack_log.detection_method,
+        )
+
+        window_start = (attack_log.timestamp or datetime.utcnow()) - timedelta(hours=1)
+
+        recent_result = await db.execute(
+            select(AttackLog)
+            .where(AttackLog.ip_address == attack_log.ip_address)
+            .where(AttackLog.attack_type == attack_log.attack_type)
+            .where(AttackLog.timestamp >= window_start)
+            .order_by(desc(AttackLog.timestamp))
+        )
+        recent_attacks = recent_result.scalars().all()
+        recent_attack_ids = [a.id for a in recent_attacks if getattr(a, 'id', None) is not None]
+        if attack_log.id is not None and attack_log.id not in recent_attack_ids:
+            recent_attack_ids.insert(0, attack_log.id)
+
+        should_create_or_update = (
+            LogService._severity_rank(attack_log.severity) >= LogService._severity_rank('high')
+            or len(recent_attack_ids) >= 3
+        )
+        if not should_create_or_update:
+            return None
+
+        open_result = await db.execute(
+            select(Incident)
+            .where(Incident.status == 'open')
+            .order_by(desc(Incident.created_at))
+        )
+        open_incidents = open_result.scalars().all()
+
+        matching_incident = None
+        for incident in open_incidents:
+            incident_meta = LogService._normalize_incident_meta(incident.meta)
+            if incident_meta.get('fingerprint') == fingerprint:
+                matching_incident = incident
+                break
+
+        current_ts = (attack_log.timestamp or datetime.utcnow()).isoformat()
+        base_title = f"Correlated attacks from {attack_log.ip_address}"
+        base_description = (
+            f"{len(recent_attack_ids)} attacks from {attack_log.ip_address} matching {attack_log.attack_type} "
+            f"were observed in the last hour."
+        )
+
+        if matching_incident is not None:
+            incident_meta = LogService._normalize_incident_meta(matching_incident.meta)
+            incident_meta.update({
+                'fingerprint': fingerprint,
+                'ip_address': attack_log.ip_address,
+                'attack_type': attack_log.attack_type,
+                'target': attack_log.target,
+                'detection_method': attack_log.detection_method,
+                'first_seen': incident_meta.get('first_seen') or current_ts,
+                'last_seen': current_ts,
+                'attack_ids': sorted(set(incident_meta.get('attack_ids', []) + recent_attack_ids)),
+                'event_count': max(
+                    int(incident_meta.get('event_count', 0)),
+                    len(sorted(set(incident_meta.get('attack_ids', []) + recent_attack_ids)))
+                ),
+            })
+            matching_incident.meta = incident_meta
+            matching_incident.title = matching_incident.title or base_title
+            if LogService._severity_rank(attack_log.severity) > LogService._severity_rank(matching_incident.severity):
+                matching_incident.severity = attack_log.severity
+            matching_incident.description = matching_incident.description or base_description
+            matching_incident.updated_at = attack_log.timestamp or datetime.utcnow()
+            await db.commit()
+            await db.refresh(matching_incident)
+            return matching_incident
+
+        from app.models import Incident as IncidentModel
+
+        new_incident = IncidentModel(
+            title=base_title,
+            description=base_description,
+            severity=attack_log.severity if LogService._severity_rank(attack_log.severity) >= LogService._severity_rank('high') else 'medium',
+            status='open',
+            meta={
+                'fingerprint': fingerprint,
+                'ip_address': attack_log.ip_address,
+                'attack_type': attack_log.attack_type,
+                'target': attack_log.target,
+                'detection_method': attack_log.detection_method,
+                'first_seen': current_ts,
+                'last_seen': current_ts,
+                'attack_ids': recent_attack_ids,
+                'event_count': len(recent_attack_ids),
+            },
+        )
+        db.add(new_incident)
+        await db.commit()
+        await db.refresh(new_incident)
+
+        try:
+            await alert_service.create_alert(
+                db,
+                alert_type='incident',
+                severity=new_incident.severity,
+                title=f'Incident: {new_incident.title}',
+                message=new_incident.description or '',
+                metadata={'incident_id': new_incident.id, 'fingerprint': fingerprint},
+            )
+        except Exception:
+            pass
+
+        return new_incident
+
     @staticmethod
     async def log_attack(
         db: AsyncSession,
@@ -32,7 +171,7 @@ class LogService:
             severity=severity,
             detection_method=detection_method,
             blocked=blocked,
-            metadata=metadata
+            meta=metadata
         )
         db.add(attack_log)
         await db.commit()
@@ -41,7 +180,7 @@ class LogService:
 
         # Broadcast the attack to any connected websocket clients (best-effort)
         try:
-            from app.main import broadcast_attack
+            from app.main import broadcast_attack, publish_app_event
 
             attack_data = {
                 "id": attack_log.id,
@@ -56,15 +195,38 @@ class LogService:
                 "timestamp": attack_log.timestamp.isoformat()
             }
 
-            # fire-and-forget
+            # Publish through shared app event helper so Redis or local fallback both work
             try:
-                import asyncio
-                asyncio.create_task(broadcast_attack(attack_data))
+                from app.main import app as fastapi_app
+                published = await publish_app_event(fastapi_app, 'ws:attacks', attack_data)
+                if not published:
+                    await broadcast_attack(attack_data)
             except Exception:
-                # fallback: call synchronously
-                await broadcast_attack(attack_data)
+                # Best-effort: don't let broadcasting break logging
+                try:
+                    await broadcast_attack(attack_data)
+                except Exception:
+                    pass
         except Exception:
             # If broadcast fails for any reason, ignore to not break logging
+            pass
+
+        # Correlate repeated/high-severity attacks into a synchronous incident.
+        try:
+            await LogService.correlate_incident(db, attack_log)
+        except Exception:
+            pass
+
+        # Publish cache invalidation to Redis (best-effort)
+        try:
+            from app.main import app as fastapi_app, publish_app_event
+
+            await publish_app_event(
+                fastapi_app,
+                'cache:security:invalidate',
+                {"attack_id": attack_log.id, "timestamp": attack_log.timestamp.isoformat()}
+            )
+        except Exception:
             pass
 
         return attack_log
@@ -166,20 +328,38 @@ class LogService:
         offset: int = 0,
         attack_type: str = None,
         severity: str = None,
-        blocked: bool = None
+        blocked: bool = None,
+        search: str = None,
+        start_time: datetime = None,
+        end_time: datetime = None
     ):
-        query = select(AttackLog).order_by(desc(AttackLog.timestamp))
+        attack_query = select(AttackLog).order_by(desc(AttackLog.timestamp))
         
         if attack_type:
-            query = query.where(AttackLog.attack_type == attack_type)
+            attack_query = attack_query.where(AttackLog.attack_type == attack_type)
         if severity:
-            query = query.where(AttackLog.severity == severity)
+            attack_query = attack_query.where(AttackLog.severity == severity)
         if blocked is not None:
-            query = query.where(AttackLog.blocked == blocked)
+            attack_query = attack_query.where(AttackLog.blocked == blocked)
+        if search:
+            like = f"%{search}%"
+            attack_query = attack_query.where(
+                or_(
+                    AttackLog.attack_type.ilike(like),
+                    AttackLog.payload.ilike(like),
+                    AttackLog.ip_address.ilike(like),
+                    AttackLog.target.ilike(like),
+                    AttackLog.detection_method.ilike(like),
+                )
+            )
+        if start_time is not None:
+            attack_query = attack_query.where(AttackLog.timestamp >= start_time)
+        if end_time is not None:
+            attack_query = attack_query.where(AttackLog.timestamp <= end_time)
         
-        query = query.limit(limit).offset(offset)
+        attack_query = attack_query.limit(limit).offset(offset)
         
-        result = await db.execute(query)
+        result = await db.execute(attack_query)
         return result.scalars().all()
     
     @staticmethod

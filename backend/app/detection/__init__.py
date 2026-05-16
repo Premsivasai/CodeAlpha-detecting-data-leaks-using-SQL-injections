@@ -49,6 +49,11 @@ class SQLInjectionDetector:
                 r'(?i)\bunion\s+(all\s+)?select\b.*\bfrom\b',
                 r'(?i)union\s+select\s+.*into\s+(outfile|dumpfile)',
             ],
+            AttackType.TAUTOLOGY: [
+                r'(?i)(or|and)\s+1\s*=\s*1',
+                r'(?i)(or|and)\s+[\'"]\s*[\'"]\s*=\s*[\'"]\s*[\'"]',
+                r'(?i)\b(1|true|yes)\s*=\s*\1\b',
+            ],
             AttackType.BOOLEAN_BASED: [
                 r'(?i)(and|or)\s+[\'"]?\w+[\'"]?\s*=\s*[\'"]?\w+[\'"]?',
                 r'(?i)\b(1|0)\s*=\s*\d+',
@@ -72,8 +77,8 @@ class SQLInjectionDetector:
                 r'(?i)(and|or)\s+\d+\s*>\s*\d+',
             ],
             AttackType.STACKED_QUERY: [
-                r';\s*(select|insert|update|delete|drop|create|alter|exec|execute)',
-                r';\s*\w+\s*--',
+                r'(?i);\s*(select|insert|update|delete|drop|create|alter|exec|execute)',
+                r'(?i);\s*\w+\s*--',
             ],
             AttackType.TAUTOLOGY: [
                 r'(?i)(or|and)\s+1\s*=\s*1',
@@ -143,18 +148,33 @@ class SQLInjectionDetector:
                 details="Query passed all detection checks",
                 detection_method="none"
             )
+        # Determine if any detection indicates malicious behavior
+        any_malicious = any(d.is_malicious for d in detections)
 
-        max_severity = max(detections, key=lambda x: self._severity_weight(x.severity))
-        avg_confidence = sum(d.confidence for d in detections) / len(detections)
+        if any_malicious:
+            malicious = [d for d in detections if d.is_malicious]
+            max_severity = max(malicious, key=lambda x: self._severity_weight(x.severity))
+            avg_confidence = sum(d.confidence for d in malicious) / len(malicious)
 
-        return DetectionResult(
-            is_malicious=True,
-            attack_type=max_severity.attack_type,
-            severity=max_severity.severity,
-            confidence=min(avg_confidence, 1.0),
-            details=f"Detected {len(detections)} attack patterns",
-            detection_method="multi_layer"
-        )
+            return DetectionResult(
+                is_malicious=True,
+                attack_type=max_severity.attack_type,
+                severity=max_severity.severity,
+                confidence=min(avg_confidence, 1.0),
+                details=f"Detected {len(malicious)} malicious patterns",
+                detection_method="multi_layer"
+            )
+        else:
+            # No malicious flags; return the most significant non-malicious finding
+            best = max(detections, key=lambda x: self._severity_weight(x.severity))
+            return DetectionResult(
+                is_malicious=False,
+                attack_type=None,
+                severity=best.severity,
+                confidence=best.confidence,
+                details=f"Detected {len(detections)} non-malicious indicators",
+                detection_method="multi_layer"
+            )
 
     def _detect_patterns(self, query: str) -> Optional[DetectionResult]:
         for attack_type, patterns in self.patterns.items():

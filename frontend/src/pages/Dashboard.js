@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import api from '../services/api';
 import { 
   Shield, 
@@ -25,6 +26,7 @@ import {
 const Dashboard = () => {
   const [stats, setStats] = useState(null);
   const [attacks, setAttacks] = useState([]);
+  const [incidents, setIncidents] = useState([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -62,6 +64,14 @@ const Dashboard = () => {
       ]);
       setStats(statsRes.data);
       setAttacks(attacksRes.data);
+
+      try {
+        const incidentsRes = await api.get('/incidents?limit=5');
+        setIncidents(incidentsRes.data || []);
+      } catch (incidentError) {
+        console.warn('Failed to fetch incidents:', incidentError);
+        setIncidents([]);
+      }
     } catch (error) {
       console.error('Failed to fetch dashboard data:', error);
     } finally {
@@ -202,6 +212,46 @@ const Dashboard = () => {
               </div>
             )}
           </div>
+        </div>
+      </div>
+
+      <div className="card" style={{ marginBottom: '2rem' }}>
+        <div className="card-header" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          <AlertTriangle size={20} />
+          Recent Incidents
+        </div>
+        <div className="attack-feed">
+          {incidents.length > 0 ? (
+            incidents.map((incident) => (
+              <Link key={incident.id} to={`/incidents/${incident.id}`} style={{ textDecoration: 'none', color: 'inherit' }}>
+              <div className="attack-item" style={{ cursor: 'pointer' }}>
+                <div>
+                  <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>
+                    {incident.title}
+                  </div>
+                  <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
+                    {incident.description || 'No description provided'}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                  <span className={`badge badge-${incident.severity === 'critical' ? 'danger' : incident.severity === 'high' ? 'warning' : 'info'}`}>
+                    {incident.severity}
+                  </span>
+                  <span className={`badge badge-${incident.status === 'open' ? 'warning' : 'success'}`}>
+                    {incident.status}
+                  </span>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                    {new Date(incident.created_at).toLocaleString()}
+                  </span>
+                </div>
+              </div>
+              </Link>
+            ))
+          ) : (
+            <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-secondary)' }}>
+              No active incidents
+            </div>
+          )}
         </div>
       </div>
 

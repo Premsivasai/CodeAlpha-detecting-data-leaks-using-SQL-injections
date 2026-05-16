@@ -1,3 +1,4 @@
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import sessionmaker
 from app.config import settings
@@ -37,6 +38,55 @@ async def get_db():
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS delivery_status VARCHAR(50) DEFAULT 'pending'
+        """))
+        await conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS delivery_target VARCHAR(255)
+        """))
+        await conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER DEFAULT 0
+        """))
+        await conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS last_delivery_error TEXT
+        """))
+        await conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP NULL
+        """))
+        await conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMP NULL
+        """))
+        await conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_attack_logs_timestamp
+            ON attack_logs (timestamp DESC)
+        """))
+        await conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_attack_logs_attack_type
+            ON attack_logs (attack_type)
+        """))
+        await conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_attack_logs_ip_address
+            ON attack_logs (ip_address)
+        """))
+        await conn.execute(text("""
+            CREATE MATERIALIZED VIEW IF NOT EXISTS hourly_attack_stats AS
+            SELECT date_trunc('hour', timestamp) AS hour,
+                   attack_type,
+                   severity,
+                   count(*) AS cnt
+            FROM attack_logs
+            GROUP BY hour, attack_type, severity
+        """))
+        await conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_hourly_attack_stats_unique
+            ON hourly_attack_stats (hour, attack_type, severity)
+        """))
 
 
 async def drop_db():

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import api from '../services/api';
 import { Bell, CheckCircle, AlertTriangle, XCircle } from 'lucide-react';
 
@@ -86,6 +87,14 @@ const Alerts = () => {
                 <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem' }}>
                   {alert.message}
                 </p>
+
+                {alert.metadata?.incident_id && (
+                  <div style={{ marginBottom: '1rem' }}>
+                    <Link to={`/incidents/${alert.metadata.incident_id}`} className="badge badge-info" style={{ textDecoration: 'none' }}>
+                      View related incident #{alert.metadata.incident_id}
+                    </Link>
+                  </div>
+                )}
                 
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <span style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>

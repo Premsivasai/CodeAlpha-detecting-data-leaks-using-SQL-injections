@@ -7,6 +7,8 @@ import Dashboard from './pages/Dashboard';
 import AttackLogs from './pages/AttackLogs';
 import SecurityStats from './pages/SecurityStats';
 import Alerts from './pages/Alerts';
+import IncidentDetail from './pages/IncidentDetail';
+import Activity from './pages/Activity';
 import AIPredictions from './pages/AIPredictions';
 import IPBlocking from './pages/IPBlocking';
 import Capabilities from './pages/Capabilities';
@@ -81,6 +83,20 @@ function App() {
             <ProtectedRoute>
               <AppLayout>
                 <Alerts />
+              </AppLayout>
+            </ProtectedRoute>
+          } />
+          <Route path="/activity" element={
+            <ProtectedRoute>
+              <AppLayout>
+                <Activity />
+              </AppLayout>
+            </ProtectedRoute>
+          } />
+          <Route path="/incidents/:incidentId" element={
+            <ProtectedRoute>
+              <AppLayout>
+                <IncidentDetail />
               </AppLayout>
             </ProtectedRoute>
           } />

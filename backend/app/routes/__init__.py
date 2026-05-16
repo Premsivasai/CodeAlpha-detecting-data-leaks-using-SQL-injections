@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from app.database import get_db
 from app.models import User, UserRole, AttackLog, SystemAlert, SecurityMetric, BlockedIP, AIDetectionResult
 from app.auth import auth_service, get_current_user, get_password_hash
@@ -97,6 +97,7 @@ class AlertResponse(BaseModel):
     title: str
     message: str
     is_resolved: bool
+    metadata: Optional[dict] = None
     created_at: datetime
 
 
@@ -465,6 +466,10 @@ async def get_attack_logs(
     limit: int = 50,
     attack_type: Optional[str] = None,
     severity: Optional[str] = None,
+    query: Optional[str] = None,
+    blocked: Optional[bool] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -475,7 +480,7 @@ async def get_attack_logs(
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     
     logs = await log_service.get_attack_logs(
-        db, limit, skip, attack_type, severity
+        db, limit, skip, attack_type, severity, blocked, query, start_time, end_time
     )
     
     return [
@@ -573,6 +578,25 @@ async def get_security_stats(
         hour_dt = (datetime.utcnow().replace(minute=0, second=0, microsecond=0) - timedelta(hours=(hours_back - 1 - i)))
         key = hour_dt.isoformat()
         timeseries.append({"time": hour_dt.isoformat(), "attacks": series_map.get(key, 0)})
+
+    # Cache result in Redis for a short period.
+    try:
+        redis = getattr(request.app.state, 'redis', None)
+        if redis is not None:
+            import orjson
+
+            payload = {
+                "total_attacks_blocked": total_attacks_blocked,
+                "attacks_today": attacks_today_count,
+                "active_blocked_ips": active_blocked_ips,
+                "active_alerts": active_alerts_count,
+                "ai_predictions_today": ai_predictions_count,
+                "top_attack_types": top_attack_types,
+                "timeseries": timeseries,
+            }
+            await redis.set(cache_key, orjson.dumps(payload), ex=15)
+    except Exception:
+        pass
     
     return SecurityStatsResponse(
         total_attacks_blocked=total_attacks_blocked,
@@ -584,23 +608,6 @@ async def get_security_stats(
         ,
         timeseries=timeseries
     )
-        # Cache result in Redis for short period
-        try:
-            redis = getattr(request.app.state, 'redis', None)
-            if redis is not None:
-                import orjson
-                payload = {
-                    "total_attacks_blocked": total_attacks_blocked,
-                    "attacks_today": attacks_today_count,
-                    "active_blocked_ips": active_blocked_ips,
-                    "active_alerts": active_alerts_count,
-                    "ai_predictions_today": ai_predictions_count,
-                    "top_attack_types": top_attack_types,
-                    "timeseries": timeseries
-                }
-                await redis.set(cache_key, orjson.dumps(payload), ex=15)
-        except Exception:
-            pass
 
 
 @router.get("/alerts", response_model=List[AlertResponse])
@@ -630,6 +637,7 @@ async def get_alerts(
             title=alert.title,
             message=alert.message,
             is_resolved=alert.is_resolved,
+            metadata=alert.meta,
             created_at=alert.created_at
         )
         for alert in result
@@ -736,3 +744,413 @@ async def list_blocked_ips(
         }
         for ip in ips
     ]
+
+ 
+
+# --- Incident response and notifications (lightweight implementations) ---
+
+
+class IncidentCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    severity: str = "medium"
+    metadata: Optional[dict] = None
+
+
+class IncidentResponse(BaseModel):
+    id: int
+    title: str
+    description: Optional[str]
+    severity: str
+    status: str
+    metadata: Optional[dict]
+    created_at: datetime
+
+
+class IncidentAttackSummary(BaseModel):
+    id: int
+    attack_type: str
+    severity: str
+    detection_method: str
+    ip_address: str
+    timestamp: datetime
+    payload: Optional[str] = None
+
+
+class IncidentDetailResponse(IncidentResponse):
+    fingerprint: Optional[str] = None
+    event_count: int = 0
+    risk_score: int = 0
+    first_seen: Optional[datetime] = None
+    last_seen: Optional[datetime] = None
+    related_attack_types: List[str] = Field(default_factory=list)
+    related_ips: List[str] = Field(default_factory=list)
+    attacks: List[IncidentAttackSummary] = Field(default_factory=list)
+
+
+class IncidentResolveRequest(BaseModel):
+    resolution_note: Optional[str] = None
+
+
+@router.post("/incidents", response_model=IncidentResponse, status_code=status.HTTP_201_CREATED)
+async def create_incident(
+    incident: IncidentCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.models import Incident as IncidentModel
+
+    new_incident = IncidentModel(
+        title=incident.title,
+        description=incident.description,
+        severity=incident.severity,
+        status="open",
+        meta=incident.metadata or {},
+        created_by=current_user.id
+    )
+
+    db.add(new_incident)
+    await db.commit()
+    await db.refresh(new_incident)
+
+    await log_service.log_audit(
+        db,
+        user_id=current_user.id,
+        action="incident_created",
+        resource="incidents",
+        details={"incident_id": new_incident.id, "title": new_incident.title}
+    )
+
+    # Create a system alert for the incident so it's visible in alerts UI
+    try:
+        await alert_service.create_alert(
+            db,
+            alert_type="incident",
+            severity=incident.severity,
+            title=f"Incident: {incident.title}",
+            message=incident.description or "",
+            metadata={"incident_id": new_incident.id}
+        )
+    except Exception:
+        # non-fatal
+        pass
+
+    return IncidentResponse(
+        id=new_incident.id,
+        title=new_incident.title,
+        description=new_incident.description,
+        severity=new_incident.severity,
+        status=new_incident.status,
+        metadata=new_incident.meta,
+        created_at=new_incident.created_at
+    )
+
+
+@router.get("/incidents", response_model=List[IncidentResponse])
+async def list_incidents(
+    skip: int = 0,
+    limit: int = 50,
+    status_filter: Optional[str] = None,
+    severity: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.models import Incident as IncidentModel
+
+    query = select(IncidentModel).offset(skip).limit(limit)
+    if status_filter:
+        query = query.where(IncidentModel.status == status_filter)
+    if severity:
+        query = query.where(IncidentModel.severity == severity)
+
+    result = await db.execute(query)
+    incidents = result.scalars().all()
+
+    return [
+        IncidentResponse(
+            id=i.id,
+            title=i.title,
+            description=i.description,
+            severity=i.severity,
+            status=i.status,
+            metadata=i.meta,
+            created_at=i.created_at
+        )
+        for i in incidents
+    ]
+
+
+@router.get("/incidents/{incident_id}", response_model=IncidentDetailResponse)
+async def get_incident(
+    incident_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.models import Incident as IncidentModel, AttackLog as AttackLogModel
+
+    result = await db.execute(select(IncidentModel).where(IncidentModel.id == incident_id))
+    incident = result.scalar_one_or_none()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    meta = incident.meta or {}
+    attack_ids = meta.get("attack_ids") or []
+    if not isinstance(attack_ids, list):
+        attack_ids = []
+
+    attacks: list[AttackLog] = []
+    if attack_ids:
+        attack_result = await db.execute(
+            select(AttackLogModel)
+            .where(AttackLogModel.id.in_(attack_ids))
+            .order_by(desc(AttackLogModel.timestamp))
+        )
+        attacks = attack_result.scalars().all()
+
+    related_attack_types = sorted({attack.attack_type for attack in attacks})
+    related_ips = sorted({attack.ip_address for attack in attacks})
+    event_count = int(meta.get("event_count", len(attacks)))
+    first_seen_raw = meta.get("first_seen")
+    last_seen_raw = meta.get("last_seen")
+
+    def _parse_dt(value: Optional[str]):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+    risk_score = min(100, 15 + (event_count * 15) + (10 if incident.severity in {"high", "critical"} else 0))
+
+    return IncidentDetailResponse(
+        id=incident.id,
+        title=incident.title,
+        description=incident.description,
+        severity=incident.severity,
+        status=incident.status,
+        metadata=incident.meta,
+        created_at=incident.created_at,
+        fingerprint=meta.get("fingerprint"),
+        event_count=event_count,
+        risk_score=risk_score,
+        first_seen=_parse_dt(first_seen_raw),
+        last_seen=_parse_dt(last_seen_raw),
+        related_attack_types=related_attack_types,
+        related_ips=related_ips,
+        attacks=[
+            IncidentAttackSummary(
+                id=attack.id,
+                attack_type=attack.attack_type,
+                severity=attack.severity,
+                detection_method=attack.detection_method,
+                ip_address=attack.ip_address,
+                timestamp=attack.timestamp,
+                payload=attack.payload,
+            )
+            for attack in attacks
+        ],
+    )
+
+
+@router.post("/incidents/{incident_id}/resolve", response_model=IncidentResponse)
+async def resolve_incident(
+    incident_id: int,
+    request: IncidentResolveRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    from app.models import Incident as IncidentModel
+
+    result = await db.execute(select(IncidentModel).where(IncidentModel.id == incident_id))
+    incident = result.scalar_one_or_none()
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    if incident.status == "resolved":
+        return IncidentResponse(
+            id=incident.id,
+            title=incident.title,
+            description=incident.description,
+            severity=incident.severity,
+            status=incident.status,
+            metadata=incident.meta,
+            created_at=incident.created_at,
+        )
+
+    meta = dict(incident.meta or {})
+    meta["resolved_at"] = datetime.utcnow().isoformat()
+    meta["resolved_by"] = current_user.id
+    if request and request.resolution_note:
+        meta["resolution_note"] = request.resolution_note
+
+    incident.status = "resolved"
+    incident.meta = meta
+    incident.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(incident)
+
+    await log_service.log_audit(
+        db,
+        user_id=current_user.id,
+        action="incident_resolved",
+        resource="incidents",
+        details={"incident_id": incident.id, "title": incident.title, "resolution_note": meta.get("resolution_note")}
+    )
+
+    try:
+        await alert_service.create_alert(
+            db,
+            alert_type="incident",
+            severity="low",
+            title=f"Incident Resolved: {incident.title}",
+            message=request.resolution_note if request and request.resolution_note else "Incident marked as resolved.",
+            metadata={"incident_id": incident.id, "resolved": True}
+        )
+    except Exception:
+        pass
+
+    return IncidentResponse(
+        id=incident.id,
+        title=incident.title,
+        description=incident.description,
+        severity=incident.severity,
+        status=incident.status,
+        metadata=incident.meta,
+        created_at=incident.created_at,
+    )
+
+
+class NotificationSendRequest(BaseModel):
+    user_id: int
+    title: str
+    message: str
+    notification_type: str = "info"
+    target: Optional[str] = None
+
+
+@router.post("/notifications/send")
+async def send_notification(
+    request: NotificationSendRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Store notification and optionally send via webhook configured in settings
+    from app.models import Notification as NotificationModel
+    from app.config import settings
+    import httpx
+
+    note = NotificationModel(
+        user_id=request.user_id,
+        title=request.title,
+        message=request.message,
+        notification_type=request.notification_type,
+        delivery_status="queued",
+        delivery_target=request.target,
+    )
+    db.add(note)
+    await db.commit()
+    await db.refresh(note)
+
+    await log_service.log_audit(
+        db,
+        user_id=current_user.id,
+        action="notification_sent",
+        resource="notifications",
+        details={"notification_id": note.id, "user_id": request.user_id}
+    )
+
+    # Enqueue the delivery job so the worker can retry on failure.
+    try:
+        from app.main import app as fastapi_app, enqueue_notification_delivery
+
+        delivery_target = request.target or getattr(settings, "NOTIFICATION_WEBHOOK", None)
+        await enqueue_notification_delivery(
+            fastapi_app,
+            note.id,
+            {
+                "notification_id": note.id,
+                "title": request.title,
+                "message": request.message,
+                "user_id": request.user_id,
+                "notification_type": request.notification_type,
+            },
+            target=delivery_target,
+            max_attempts=4,
+        )
+    except Exception:
+        pass
+
+    return {"status": "queued", "id": note.id, "delivery_target": request.target or getattr(settings, "NOTIFICATION_WEBHOOK", None)}
+
+
+class ActivityItem(BaseModel):
+    id: int
+    type: str
+    created_at: datetime
+    details: dict
+
+
+@router.get("/activity", response_model=List[ActivityItem])
+async def get_activity(
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if not permission_checker.has_permission(
+        permission_checker.get_permissions(current_user.role.value),
+        "activity:read"
+    ):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    from app.models import NotificationDeliveryAttempt as NDA, Notification as NotificationModel, Incident as IncidentModel
+
+    # Fetch recent notification delivery attempts
+    nd_result = await db.execute(
+        select(NDA).order_by(desc(NDA.created_at)).limit(limit)
+    )
+    attempts = nd_result.scalars().all()
+
+    items: List[ActivityItem] = []
+    for a in attempts:
+        notif = None
+        try:
+            notif_res = await db.execute(select(NotificationModel).where(NotificationModel.id == a.notification_id))
+            notif = notif_res.scalar_one_or_none()
+        except Exception:
+            notif = None
+
+        details = {
+            "notification_id": a.notification_id,
+            "target": a.target,
+            "attempt_number": a.attempt_number,
+            "status": a.status,
+            "error_message": a.error_message,
+            "response_code": a.response_code,
+        }
+        if notif:
+            details["title"] = notif.title
+
+        items.append(ActivityItem(id=a.id, type="notification_attempt", created_at=a.created_at, details=details))
+
+    # If we have space, include recent incident updates
+    remaining = max(0, limit - len(items))
+    if remaining > 0:
+        inc_result = await db.execute(
+            select(IncidentModel).order_by(desc(IncidentModel.updated_at)).limit(remaining)
+        )
+        incidents = inc_result.scalars().all()
+        for inc in incidents:
+            details = {
+                "incident_id": inc.id,
+                "title": inc.title,
+                "severity": inc.severity,
+                "status": inc.status,
+            }
+            items.append(ActivityItem(id=inc.id * 1000000, type="incident", created_at=inc.updated_at or inc.created_at, details=details))
+
+    # Sort combined items by created_at desc and limit
+    items_sorted = sorted(items, key=lambda x: x.created_at or datetime.utcnow(), reverse=True)
+
+    return items_sorted[:limit]

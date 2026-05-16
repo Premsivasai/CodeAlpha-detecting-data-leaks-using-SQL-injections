@@ -119,15 +119,20 @@ class AIQueryDetector:
         score = 0.0
         
         for feature_name, value in features.items():
+            # Only include numeric features in score calculation
             weight = self.feature_weights.get(feature_name, 0.1)
-            score += weight * value
+            if isinstance(value, (int, float)):
+                score += weight * value
+            else:
+                # skip non-numeric (e.g., 'query')
+                continue
         
         pattern_score = 0.0
         query_lower = features.get('query', '').lower() if isinstance(features.get('query'), str) else ''
         
         for pattern in self.known_malicious_patterns:
             if pattern in query_lower:
-                pattern_score += 0.05
+                pattern_score += 0.10
         
         score = min(score + pattern_score, 1.0)
         
@@ -142,9 +147,9 @@ class AIQueryDetector:
         if threat_score >= 0.7:
             prediction = "malicious"
             confidence = 0.85 + (threat_score - 0.7) * 0.5
-        elif threat_score >= 0.4:
+        elif threat_score >= 0.3:
             prediction = "suspicious"
-            confidence = 0.6 + (threat_score - 0.4) * 0.5
+            confidence = 0.6 + (threat_score - 0.3) * 0.5
         else:
             prediction = "benign"
             confidence = 0.7 + (0.4 - threat_score) * 0.5

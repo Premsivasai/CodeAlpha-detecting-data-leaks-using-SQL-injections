@@ -1,22 +1,29 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import api from '../services/api';
 import { ShieldAlert, Filter, RefreshCw } from 'lucide-react';
 
 const AttackLogs = () => {
   const [attacks, setAttacks] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [filter, setFilter] = useState({ type: '', severity: '' });
+  const [filter, setFilter] = useState({
+    type: '',
+    severity: '',
+    query: '',
+    blocked: '',
+    startTime: '',
+    endTime: ''
+  });
 
-  useEffect(() => {
-    fetchAttacks();
-  }, [filter]);
-
-  const fetchAttacks = async () => {
+  const fetchAttacks = useCallback(async () => {
     setLoading(true);
     try {
       const params = new URLSearchParams();
       if (filter.type) params.append('attack_type', filter.type);
       if (filter.severity) params.append('severity', filter.severity);
+      if (filter.query) params.append('query', filter.query);
+      if (filter.blocked !== '') params.append('blocked', filter.blocked);
+      if (filter.startTime) params.append('start_time', filter.startTime);
+      if (filter.endTime) params.append('end_time', filter.endTime);
       
       const response = await api.get(`/logs/attacks?${params.toString()}`);
       setAttacks(response.data);
@@ -25,7 +32,11 @@ const AttackLogs = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [filter]);
+
+  useEffect(() => {
+    fetchAttacks();
+  }, [fetchAttacks]);
 
   return (
     <div className="page-container">
@@ -38,7 +49,7 @@ const AttackLogs = () => {
       </div>
 
       <div className="card" style={{ marginBottom: '1.5rem' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '1rem' }}>
           <Filter size={20} color="var(--text-secondary)" />
           <select 
             className="input" 
@@ -47,11 +58,11 @@ const AttackLogs = () => {
             onChange={(e) => setFilter({ ...filter, type: e.target.value })}
           >
             <option value="">All Types</option>
-            <option value="union_based">Union Based</option>
-            <option value="boolean_based">Boolean Based</option>
+            <option value="sql_injection">SQL Injection</option>
+            <option value="union_injection">Union Injection</option>
+            <option value="boolean_blind">Boolean Blind</option>
             <option value="error_based">Error Based</option>
             <option value="time_based">Time Based</option>
-            <option value="blind_sql">Blind SQL</option>
             <option value="stacked_query">Stacked Query</option>
           </select>
           
@@ -67,6 +78,42 @@ const AttackLogs = () => {
             <option value="medium">Medium</option>
             <option value="low">Low</option>
           </select>
+
+          <select
+            className="input"
+            style={{ width: 'auto' }}
+            value={filter.blocked}
+            onChange={(e) => setFilter({ ...filter, blocked: e.target.value })}
+          >
+            <option value="">All Outcomes</option>
+            <option value="true">Blocked</option>
+            <option value="false">Allowed</option>
+          </select>
+
+          <input
+            className="input"
+            style={{ width: '220px' }}
+            type="text"
+            placeholder="Search IP, payload, or type"
+            value={filter.query}
+            onChange={(e) => setFilter({ ...filter, query: e.target.value })}
+          />
+
+          <input
+            className="input"
+            style={{ width: '190px' }}
+            type="datetime-local"
+            value={filter.startTime}
+            onChange={(e) => setFilter({ ...filter, startTime: e.target.value })}
+          />
+
+          <input
+            className="input"
+            style={{ width: '190px' }}
+            type="datetime-local"
+            value={filter.endTime}
+            onChange={(e) => setFilter({ ...filter, endTime: e.target.value })}
+          />
         </div>
       </div>
 

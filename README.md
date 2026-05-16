@@ -130,6 +130,56 @@ npm install
 npm start
 ```
 
+## Local Runbook
+
+This repository now supports a fully local run with the backend, PostgreSQL, and Redis.
+
+### 1. Start the data services
+
+Use Docker Compose if available:
+```bash
+docker-compose up -d db redis
+```
+
+If you only need Redis, a standalone container works as well:
+```bash
+docker run -p 6379:6379 --name secureshield-redis -d redis:7
+```
+
+### 2. Initialize the database
+
+From the `backend` directory, run:
+```bash
+.\venv\Scripts\python.exe init_db.py
+```
+
+This creates the tables, applies the phase 1 indexes/materialized view, seeds sample attack logs, and creates the default users.
+
+### 3. Start the backend
+
+```bash
+cd backend
+.\venv\Scripts\python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 4. Start the frontend
+
+```bash
+cd frontend
+npm start
+```
+
+### Default credentials
+
+- Username: `admin`
+- Password: `Admin123!`
+
+### Useful flows
+
+- Dashboard: live stats, timeseries, and recent alerts
+- Attack logs: filter by attack type, severity, blocked status, search string, and time range
+- MFA: open `/mfa-setup`, initialize TOTP, scan the QR, then verify the generated code
+
 ## API Endpoints
 
 ### Authentication
@@ -143,10 +193,14 @@ npm start
 
 ### Security
 - `GET /api/v1/security/stats` - Get security statistics
-- `GET /api/v1/logs/attacks` - Get attack logs
+- `GET /api/v1/logs/attacks` - Get attack logs with filtering/search
 - `GET /api/v1/alerts` - Get security alerts
 - `POST /api/v1/ip/block` - Block IP address
 - `POST /api/v1/ip/unblock` - Unblock IP address
+
+### Authentication Extras
+- `POST /api/v1/auth/mfa/setup` - Create a TOTP secret and provisioning URI
+- `POST /api/v1/auth/mfa/verify` - Verify a TOTP code and enable MFA
 
 ### Capabilities
 - `POST /api/v1/capability/generate` - Generate capability token
@@ -221,3 +275,13 @@ MIT License - See LICENSE file for details.
 ## Support
 
 For issues and feature requests, please create an issue in the repository.
+
+## Completed Tasks (local workspace)
+
+The project Phase 1 TODOs have been completed in this workspace. Added items include:
+- Incident response endpoints (`POST /api/v1/incidents`, `GET /api/v1/incidents`)
+- Notification storage & webhook sender (`POST /api/v1/notifications/send`)
+- Database `incidents` table and lightweight audit logging
+- Simple unit test for the `Incident` model (`backend/tests/test_incidents.py`)
+
+If you'd like, I can continue by adding a frontend incident dashboard, richer alerting integrations (Slack, PagerDuty), or scheduled materialized view refresh tasks.
