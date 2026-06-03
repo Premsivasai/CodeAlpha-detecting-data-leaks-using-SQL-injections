@@ -4,26 +4,96 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func
 from datetime import datetime
 from typing import Optional, List
+from copy import deepcopy
 from pydantic import BaseModel, EmailStr, Field
 from app.database import get_db
 from app.models import User, UserRole, AttackLog, SystemAlert, SecurityMetric, BlockedIP, AIDetectionResult
+from app.models import GlobalConfig, DatabaseConnection, QueryLog
 from app.auth import auth_service, get_current_user, get_password_hash
 from app.config import settings
 import pyotp
 from app.capability import capability_manager, permission_checker
 from app.detection import sql_injection_detector, Severity
 from app.ai_detection import ai_detector
-from app.logs import log_service, alert_service, ip_blocker
+from app.logs import log_service, alert_service, ip_blocker, secure_execution_service
 from app.encryption import encryption_service
+from app.security.query_sandbox import query_sandbox
+from app.db_connectors.postgres_connector import PostgresConnector
+from app.db_connectors import MySQLConnector, MongoDBConnector
+from app.db_connectors.pool_manager import db_pool_manager
+from app.utils.rate_limiter import allow_request
+import asyncio
+import socket
+try:
+    import redis.asyncio as aioredis
+except Exception:
+    aioredis = None
+import logging
+import json
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter()
+
+# Simple in-memory fallback for rate limiting when Redis isn't available
+RATE_LIMIT_STORE = {}
+
+
+class ReplayRequest(BaseModel):
+    query_log_id: int
+    allow_reexecute: bool = False
+
+
+async def _check_rate_limit(http_request: Request, current_user: User) -> None:
+    """Enforce per-user/tenant rate limits using Redis when available, else fallback to in-memory."""
+    # Determine limits by role
+    try:
+        role_name = current_user.role.name.lower() if hasattr(current_user.role, 'name') else str(current_user.role).lower()
+    except Exception:
+        role_name = 'user'
+
+    limits = {
+        'super_admin': 1000,
+        'admin': 500,
+        'security_analyst': 300,
+        'user': 60,
+    }
+    window_seconds = 60
+    limit = limits.get(role_name, limits['user'])
+
+    redis = getattr(http_request.app.state, 'redis', None)
+    key = f"rate:{current_user.tenant_id or 'global'}:{current_user.id}"
+
+    if redis is not None:
+        try:
+            allowed = await allow_request(redis, key, limit, window_seconds)
+            if not allowed:
+                raise HTTPException(status_code=429, detail='Rate limit exceeded')
+            return
+        except HTTPException:
+            raise
+        except Exception:
+            # Fallthrough to in-memory fallback
+            pass
+
+    # In-memory sliding window (coarse)
+    now_ts = int(datetime.utcnow().timestamp())
+    entry = RATE_LIMIT_STORE.get(key)
+    if not entry or entry['expires_at'] <= now_ts:
+        RATE_LIMIT_STORE[key] = {'count': 1, 'expires_at': now_ts + window_seconds}
+    else:
+        entry['count'] += 1
+        if entry['count'] > limit:
+            raise HTTPException(status_code=429, detail='Rate limit exceeded')
+
 
 
 class UserCreate(BaseModel):
     username: str
     email: EmailStr
     password: str
+    phone_number: Optional[str] = None
     role: str = "user"
 
 
@@ -31,11 +101,73 @@ class UserResponse(BaseModel):
     id: int
     username: str
     email: str
+    phone_number: Optional[str] = None
     role: str
     is_active: bool
     is_verified: bool
     last_login: Optional[datetime] = None
     created_at: datetime
+
+
+class UserSettingsModel(BaseModel):
+    general: dict = Field(default_factory=dict)
+    security: dict = Field(default_factory=dict)
+    notifications: dict = Field(default_factory=dict)
+    detection: dict = Field(default_factory=dict)
+    database: dict = Field(default_factory=dict)
+
+
+DEFAULT_USER_SETTINGS = {
+    "general": {
+        "autoRefresh": True,
+        "refreshInterval": 30,
+        "language": "en",
+    },
+    "security": {
+        "mfaEnabled": False,
+        "sessionTimeout": 30,
+        "ipWhitelist": False,
+        "allowedIPs": [],
+        "apiKeyRequired": True,
+    },
+    "notifications": {
+        "emailAlerts": True,
+        "slackWebhook": "",
+        "webhookUrl": "",
+        "alertOnCritical": True,
+        "alertOnHigh": True,
+        "alertOnMedium": False,
+        "alertOnLow": False,
+    },
+    "detection": {
+        "aiDetectionEnabled": True,
+        "threatScoreThreshold": 0.7,
+        "autoBlockEnabled": True,
+        "logAllQueries": False,
+        "maxQueryLength": 5000,
+    },
+    "database": {
+        "postgresHost": "localhost",
+        "postgresPort": 5432,
+        "postgresDatabase": "secureshield",
+        "redisHost": "localhost",
+        "redisPort": 6379,
+    },
+}
+
+
+def _merge_user_settings(stored_settings: Optional[dict]) -> dict:
+    merged = deepcopy(DEFAULT_USER_SETTINGS)
+
+    if not isinstance(stored_settings, dict):
+        return merged
+
+    for category, default_values in merged.items():
+        incoming_values = stored_settings.get(category, {})
+        if isinstance(incoming_values, dict):
+            default_values.update(incoming_values)
+
+    return merged
 
 
 class TokenResponse(BaseModel):
@@ -76,6 +208,12 @@ class AttackDetectionResponse(BaseModel):
     confidence: float
     details: str
     detection_method: str
+    threat_score: Optional[float] = None
+    risk_level: Optional[str] = None
+    explanation: Optional[str] = None
+    sandbox_blocked: Optional[bool] = None
+    affected_tables: Optional[List[str]] = None
+    recommended_action: Optional[str] = None
 
 
 class AIDetectionResponse(BaseModel):
@@ -117,6 +255,76 @@ class IPBlockResponse(BaseModel):
     reason: Optional[str]
 
 
+class TestConnectionRequest(BaseModel):
+    type: str  # 'db' or 'redis'
+    host: str
+    port: int
+    database: Optional[str] = None
+
+
+class TestConnectionResponse(BaseModel):
+    ok: bool
+    details: Optional[str] = None
+
+
+class AdminConfigItem(BaseModel):
+    key: str
+    value: dict
+    encrypted: bool = False
+
+
+class DatabaseConnectionCreate(BaseModel):
+    name: str
+    db_type: str = Field(pattern=r"^(postgres|mysql|mongodb)$")
+    host: str
+    port: int
+    database_name: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    ssl_enabled: bool = True
+    metadata: Optional[dict] = None
+
+
+class DatabaseConnectionResponse(BaseModel):
+    id: int
+    tenant_id: Optional[int] = None
+    name: str
+    db_type: str
+    host: str
+    port: int
+    database_name: Optional[str] = None
+    username: Optional[str] = None
+    ssl_enabled: bool
+    is_active: bool
+    status: str
+    last_tested_at: Optional[datetime] = None
+    last_test_ok: Optional[bool] = None
+    metadata: Optional[dict] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DatabaseConnectionTestRequest(BaseModel):
+    host: Optional[str] = None
+    port: Optional[int] = None
+    db_type: Optional[str] = Field(default=None, pattern=r"^(postgres|mysql|mongodb)$")
+    database_name: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    ssl_enabled: bool = True
+    connection_id: Optional[int] = None
+
+
+class SecureQueryRequest(BaseModel):
+    query: str
+    parameters: Optional[List] = None
+    fetch_one: bool = False
+    fetch_all: bool = True
+    # For non-SQL backends (mongodb) specify mode and collection
+    mode: Optional[str] = None
+    collection: Optional[str] = None
+
+
 @router.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     try:
@@ -129,12 +337,14 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         user_data.username,
         user_data.email,
         user_data.password,
+        user_data.phone_number,
         role
     )
     
     await log_service.log_audit(
         db,
         user_id=user.id,
+        tenant_id=user.tenant_id,
         action="user_registered",
         resource="users",
         details={"username": user.username, "role": role.value}
@@ -149,6 +359,7 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         id=user.id,
         username=user.username,
         email=decrypted_email,
+        phone_number=user.phone_number,
         role=user.role.value,
         is_active=user.is_active,
         is_verified=user.is_verified,
@@ -178,12 +389,30 @@ async def login(
     await log_service.log_audit(
         db,
         user_id=user.id,
+        tenant_id=user.tenant_id,
         action="user_login",
         resource="auth",
         details={"username": user.username}
     )
-    
-    return auth_service.create_tokens(user)
+
+    tokens = auth_service.create_tokens(user)
+
+    # Persist refresh token for revocation support
+    try:
+        from app.models import RefreshToken
+        from datetime import timedelta
+        import hashlib
+
+        expires_at = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+        token_hash = hashlib.sha256(tokens['refresh_token'].encode('utf-8')).hexdigest()
+        rt = RefreshToken(token=token_hash, user_id=user.id, expires_at=expires_at)
+        db.add(rt)
+        await db.commit()
+    except Exception:
+        # If persisting fails, continue but log a warning
+        logger.warning('Failed to persist refresh token to DB')
+
+    return tokens
 
 
 class RefreshTokenRequest(BaseModel):
@@ -199,13 +428,28 @@ async def refresh_token(
     
     try:
         payload = decode_token(request.refresh_token)
-        
+
         if payload.get("type") != "refresh":
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token type"
             )
-        
+
+        # Ensure refresh token exists in DB and is not revoked (tokens are stored hashed)
+        try:
+            import hashlib
+            from app.models import RefreshToken as RT
+            token_hash = hashlib.sha256(request.refresh_token.encode('utf-8')).hexdigest()
+            result_rt = await db.execute(select(RT).where(RT.token == token_hash))
+            rt_obj = result_rt.scalar_one_or_none()
+            if not rt_obj or rt_obj.revoked:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token revoked or not found")
+        except HTTPException:
+            raise
+        except Exception:
+            # If DB check fails, reject the token for safety
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+
         user_id = payload.get("sub")
         if user_id is None:
             raise HTTPException(
@@ -232,7 +476,30 @@ async def refresh_token(
         
         access_token = create_access_token(data={"sub": user.id, "role": user.role.value})
         refresh_token_new = create_refresh_token(data={"sub": user.id})
-        
+
+        # Rotate refresh token: revoke old and persist new hashed token
+        try:
+            import hashlib
+            from datetime import timedelta
+            from app.models import RefreshToken as RT
+
+            # revoke old
+            rt_obj.revoked = True
+            db.add(rt_obj)
+
+            # persist new
+            new_hash = hashlib.sha256(refresh_token_new.encode('utf-8')).hexdigest()
+            expires_at = datetime.utcnow() + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+            new_rt = RT(token=new_hash, user_id=user.id, expires_at=expires_at)
+            db.add(new_rt)
+            await db.commit()
+        except Exception:
+            # best-effort: if DB rotation fails, continue returning tokens
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
         return {
             "access_token": access_token,
             "refresh_token": refresh_token_new,
@@ -286,6 +553,701 @@ async def mfa_verify(request: MFAVerifyRequest, current_user: User = Depends(get
         raise HTTPException(status_code=400, detail="Invalid token")
 
 
+@router.post('/admin/config/test', response_model=TestConnectionResponse)
+async def test_connection(request: TestConnectionRequest, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    # admin-only
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    host = request.host
+    port = request.port
+    t = 3
+    try:
+        # quick TCP check
+        fut = asyncio.open_connection(host, port)
+        reader, writer = await asyncio.wait_for(fut, timeout=t)
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+    except Exception as e:
+        return TestConnectionResponse(ok=False, details=f"TCP connect failed: {str(e)}")
+
+    if request.type == 'redis' and aioredis:
+        try:
+            r = aioredis.Redis(host=host, port=port, db=0)
+            pong = await asyncio.wait_for(r.ping(), timeout=t)
+            await r.close()
+            if pong:
+                return TestConnectionResponse(ok=True, details='Redis PONG')
+            else:
+                return TestConnectionResponse(ok=False, details='Redis ping failed')
+        except Exception as e:
+            return TestConnectionResponse(ok=False, details=f"Redis test failed: {str(e)}")
+
+    # For DB we only check TCP reachability above; a more thorough check would require credentials
+    return TestConnectionResponse(ok=True, details='TCP reachable')
+
+
+@router.post('/connections', response_model=DatabaseConnectionResponse)
+async def create_database_connection(
+    payload: DatabaseConnectionCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.SECURITY_ANALYST):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    encrypted_password = encryption_service.encrypt(payload.password) if payload.password else None
+    connection = await secure_execution_service.register_connection(db, current_user.tenant_id, payload, encrypted_password)
+
+    await log_service.log_audit(
+        db,
+        user_id=current_user.id,
+        tenant_id=current_user.tenant_id,
+        action='database_connection_created',
+        resource='database_connections',
+        details={'connection_id': connection.id, 'db_type': payload.db_type, 'name': payload.name}
+    )
+
+    return DatabaseConnectionResponse(
+        id=connection.id,
+        tenant_id=connection.tenant_id,
+        name=connection.name,
+        db_type=connection.db_type,
+        host=connection.host,
+        port=connection.port,
+        database_name=connection.database_name,
+        username=connection.username,
+        ssl_enabled=connection.ssl_enabled,
+        is_active=connection.is_active,
+        status=connection.status,
+        last_tested_at=connection.last_tested_at,
+        last_test_ok=connection.last_test_ok,
+        metadata=connection.connection_metadata or {},
+        created_at=connection.created_at,
+        updated_at=connection.updated_at,
+    )
+
+
+@router.get('/connections', response_model=List[DatabaseConnectionResponse])
+async def list_database_connections(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.SECURITY_ANALYST):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    connections = await secure_execution_service.list_connections(db, current_user.tenant_id)
+    return [
+        DatabaseConnectionResponse(
+            id=connection.id,
+            tenant_id=connection.tenant_id,
+            name=connection.name,
+            db_type=connection.db_type,
+            host=connection.host,
+            port=connection.port,
+            database_name=connection.database_name,
+            username=connection.username,
+            ssl_enabled=connection.ssl_enabled,
+            is_active=connection.is_active,
+            status=connection.status,
+            last_tested_at=connection.last_tested_at,
+            last_test_ok=connection.last_test_ok,
+            metadata=connection.connection_metadata or {},
+            created_at=connection.created_at,
+            updated_at=connection.updated_at,
+        )
+        for connection in connections
+    ]
+
+
+@router.post('/connections/test', response_model=TestConnectionResponse)
+async def test_database_connection(
+    request: DatabaseConnectionTestRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.SECURITY_ANALYST):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    connection = None
+    if request.connection_id is not None:
+        connection = await secure_execution_service.get_connection(db, request.connection_id, current_user.tenant_id)
+        if connection is None:
+            raise HTTPException(status_code=404, detail='Connection not found')
+
+    db_type = (request.db_type or (connection.db_type if connection else '')).lower()
+    host = request.host or (connection.host if connection else None)
+    port = request.port or (connection.port if connection else None)
+    database_name = request.database_name or (connection.database_name if connection else None)
+    username = request.username or (connection.username if connection else None)
+    password = request.password or None
+    ssl_enabled = request.ssl_enabled if request.connection_id is None else bool(connection.ssl_enabled)
+
+    if not host or not port:
+        raise HTTPException(status_code=400, detail='Host and port are required')
+
+    ok = False
+    details = 'Connection test not performed'
+
+    if db_type == 'postgres':
+        connector = PostgresConnector(host=host, port=port, user=username or 'postgres', password=password or '', database=database_name or 'postgres', ssl_enabled=ssl_enabled)
+        ok = await connector.test_connection()
+        details = 'PostgreSQL reachable' if ok else 'PostgreSQL connection failed'
+    elif db_type == 'mysql':
+        connector = MySQLConnector(host=host, port=port, user=username or 'root', password=password or '', database=database_name or '', ssl_enabled=ssl_enabled)
+        ok = await connector.test_connection()
+        details = 'MySQL reachable' if ok else 'MySQL connection failed'
+    elif db_type == 'mongodb':
+        connector = MongoDBConnector(host=host, port=port, user=username or '', password=password or '', database=database_name or 'admin', tls_enabled=ssl_enabled)
+        ok = await connector.connect()
+        if ok:
+            ok = await connector.test_connection()
+        details = 'MongoDB reachable' if ok else 'MongoDB connection failed'
+    else:
+        raise HTTPException(status_code=400, detail='Unsupported database type')
+
+    if connection is not None:
+        await secure_execution_service.update_test_status(db, connection, ok, 'healthy' if ok else 'failed')
+
+    return TestConnectionResponse(ok=ok, details=details)
+
+
+@router.get('/connections/{connection_id}/schema')
+async def get_connection_schema(
+    connection_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.SECURITY_ANALYST):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    connection = await secure_execution_service.get_connection(db, connection_id, current_user.tenant_id)
+    if connection is None:
+        raise HTTPException(status_code=404, detail='Connection not found')
+
+    if connection.db_type == 'postgres':
+        connector = PostgresConnector(host=connection.host, port=connection.port, user=connection.username or 'postgres', password=encryption_service.decrypt(connection.password_encrypted) if connection.password_encrypted else '', database=connection.database_name or 'postgres', ssl_enabled=connection.ssl_enabled)
+        tables = await connector.execute_query(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+            ORDER BY table_name
+            """,
+            fetch_all=True,
+        )
+        schema = []
+        for row in tables or []:
+            table_name = row.get('table_name') if hasattr(row, 'get') else row['table_name'] if isinstance(row, dict) else row[0]
+            columns = await connector.execute_query(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = $1
+                ORDER BY ordinal_position
+                """,
+                params=[table_name],
+                fetch_all=True,
+            )
+            schema.append({
+                'table': table_name,
+                'columns': [dict(column) if hasattr(column, 'items') else column for column in (columns or [])],
+            })
+        return {'connection_id': connection_id, 'db_type': connection.db_type, 'schema': schema}
+
+    if connection.db_type == 'mysql':
+        connector = MySQLConnector(host=connection.host, port=connection.port, user=connection.username or 'root', password=encryption_service.decrypt(connection.password_encrypted) if connection.password_encrypted else '', database=connection.database_name or '', ssl_enabled=connection.ssl_enabled)
+        tables = await connector.execute_query("SHOW TABLES", fetch_all=True)
+        schema = []
+        for row in tables or []:
+            table_name = list(row.values())[0] if isinstance(row, dict) else row[0]
+            columns = await connector.execute_query(f"SHOW COLUMNS FROM `{table_name}`", fetch_all=True)
+            schema.append({
+                'table': table_name,
+                'columns': [dict(column) if hasattr(column, 'items') else column for column in (columns or [])],
+            })
+        return {'connection_id': connection_id, 'db_type': connection.db_type, 'schema': schema}
+
+    return {'connection_id': connection_id, 'db_type': connection.db_type, 'schema': connection.connection_metadata or {}}
+
+
+@router.get('/connections/{connection_id}/history')
+async def get_connection_history(
+    connection_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.SECURITY_ANALYST):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    connection = await secure_execution_service.get_connection(db, connection_id, current_user.tenant_id)
+    if connection is None:
+        raise HTTPException(status_code=404, detail='Connection not found')
+
+    result = await db.execute(
+        select(QueryLog)
+        .where(QueryLog.connection_id == connection_id)
+        .order_by(desc(QueryLog.timestamp))
+        .limit(50)
+    )
+    rows = result.scalars().all()
+    return [
+        {
+            'id': row.id,
+            'query': row.query,
+            'parameters': row.parameters or {},
+            'execution_time': row.execution_time,
+            'blocked': row.blocked,
+            'block_reason': row.block_reason,
+            'timestamp': row.timestamp.isoformat() if row.timestamp else None,
+        }
+        for row in rows
+    ]
+
+
+@router.post('/connections/{connection_id}/execute')
+async def execute_secure_query(
+    connection_id: int,
+    payload: SecureQueryRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    http_request: Request = None,
+):
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.SECURITY_ANALYST):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    connection = await secure_execution_service.get_connection(db, connection_id, current_user.tenant_id)
+    if connection is None:
+        raise HTTPException(status_code=404, detail='Connection not found')
+
+    # enforce basic rate limiting per-user/tenant
+    try:
+        await _check_rate_limit(http_request, current_user)
+    except HTTPException:
+        await log_service.log_audit(
+            db,
+            user_id=current_user.id,
+            tenant_id=current_user.tenant_id,
+            action='rate_limited',
+            resource='database_connections',
+            details={'connection_id': connection_id}
+        )
+        raise
+
+    sandbox = query_sandbox.analyze(payload.query)
+    if sandbox.blocked:
+        await log_service.log_query(
+            db,
+            user_id=current_user.id,
+            query=payload.query,
+            parameters={"connection_id": connection_id, "reason": sandbox.explanation},
+            execution_time=0.0,
+            ip_address=None,
+            blocked=True,
+            block_reason=sandbox.recommendation,
+            tenant_id=current_user.tenant_id,
+            connection_id=connection_id,
+        )
+        raise HTTPException(status_code=403, detail=sandbox.recommendation)
+
+    if connection.db_type == 'postgres':
+        connector = db_pool_manager.register_postgres(
+            name=connection.name,
+            host=connection.host,
+            port=connection.port,
+            user=connection.username or 'postgres',
+            password=encryption_service.decrypt(connection.password_encrypted) if connection.password_encrypted else '',
+            database=connection.database_name or 'postgres',
+            ssl=connection.ssl_enabled,
+            tenant_id=current_user.tenant_id or 'global',
+        )
+    elif connection.db_type == 'mysql':
+        connector = db_pool_manager.register_mysql(
+            name=connection.name,
+            host=connection.host,
+            port=connection.port,
+            user=connection.username or 'root',
+            password=encryption_service.decrypt(connection.password_encrypted) if connection.password_encrypted else '',
+            database=connection.database_name or '',
+            ssl=connection.ssl_enabled,
+            tenant_id=current_user.tenant_id or 'global',
+        )
+    elif connection.db_type == 'mongodb':
+        connector = db_pool_manager.register_mongodb(
+            name=connection.name,
+            host=connection.host,
+            port=connection.port,
+            user=connection.username or '',
+            password=encryption_service.decrypt(connection.password_encrypted) if connection.password_encrypted else '',
+            database=connection.database_name or 'admin',
+            tls=connection.ssl_enabled,
+            tenant_id=current_user.tenant_id or 'global',
+        )
+    else:
+        raise HTTPException(status_code=400, detail='Unsupported database type')
+
+    query_start = datetime.utcnow()
+
+    # MongoDB uses different execution primitives
+    # set role-based execution timeout
+    try:
+        role_name = current_user.role.name.lower() if hasattr(current_user.role, 'name') else str(current_user.role).lower()
+    except Exception:
+        role_name = 'user'
+    timeout_map = {
+        'super_admin': 60,
+        'admin': 60,
+        'security_analyst': 30,
+        'user': 10,
+    }
+    exec_timeout = timeout_map.get(role_name, 10)
+
+    if connection.db_type == 'mongodb':
+        # require collection for Mongo operations
+        if not payload.collection:
+            raise HTTPException(status_code=400, detail='MongoDB execution requires a collection name')
+
+        # try to interpret query as JSON for find/aggregate
+        doc_payload = payload.query
+        try:
+            if isinstance(payload.query, str):
+                doc_payload = json.loads(payload.query)
+        except Exception:
+            doc_payload = payload.query
+
+        if payload.mode and str(payload.mode).lower().startswith('agg'):
+            pipeline = doc_payload if isinstance(doc_payload, list) else [doc_payload]
+            result = await asyncio.wait_for(connector.execute_aggregate(payload.collection, pipeline), timeout=exec_timeout)
+        else:
+            query_doc = doc_payload if isinstance(doc_payload, dict) else {}
+            result = await asyncio.wait_for(connector.execute_find(payload.collection, query_doc, projection=None, limit=200), timeout=exec_timeout)
+    else:
+        result = await asyncio.wait_for(connector.execute_query(
+            payload.query,
+            params=payload.parameters,
+            fetch_one=payload.fetch_one,
+            fetch_all=payload.fetch_all,
+        ), timeout=exec_timeout)
+    execution_time = (datetime.utcnow() - query_start).total_seconds()
+
+    await log_service.log_query(
+        db,
+        user_id=current_user.id,
+        query=payload.query,
+        parameters={"connection_id": connection_id, "params": payload.parameters or []},
+        execution_time=execution_time,
+        ip_address=None,
+        blocked=False,
+        block_reason=None,
+        tenant_id=current_user.tenant_id,
+        connection_id=connection_id,
+    )
+
+    result_rows = []
+    if isinstance(result, list):
+        for row in result[:200]:
+            if hasattr(row, 'items'):
+                result_rows.append(dict(row))
+            else:
+                result_rows.append(row)
+    elif hasattr(result, 'items'):
+        result_rows = [dict(result)]
+    elif result is None:
+        result_rows = []
+    else:
+        result_rows = [result]
+
+    await log_service.log_audit(
+        db,
+        user_id=current_user.id,
+        tenant_id=current_user.tenant_id,
+        action='secure_query_executed',
+        resource='database_connections',
+        details={'connection_id': connection_id, 'rows': len(result_rows), 'blocked': False},
+    )
+
+    return {
+        'connection': {
+            'id': connection.id,
+            'name': connection.name,
+            'db_type': connection.db_type,
+        },
+        'analysis': sandbox.to_dict(),
+        'execution_time': execution_time,
+        'row_count': len(result_rows),
+        'results': result_rows,
+    }
+
+
+
+@router.post('/connections/{connection_id}/replay')
+async def replay_query(
+    connection_id: int,
+    replay: ReplayRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    http_request: Request = None,
+):
+    # fetch the logged query
+    stmt = select(QueryLog).where(QueryLog.id == replay.query_log_id, QueryLog.connection_id == connection_id)
+    res = await db.execute(stmt)
+    qlog = res.scalar_one_or_none()
+    if qlog is None:
+        raise HTTPException(status_code=404, detail='Query log entry not found')
+
+    # sandbox the original query
+    sandbox_result = query_sandbox.analyze(qlog.query)
+
+    # record that a replay was requested (simulation or real)
+    await log_service.log_audit(
+        db,
+        user_id=current_user.id,
+        tenant_id=current_user.tenant_id,
+        action='replay_requested',
+        resource='database_connections',
+        details={'connection_id': connection_id, 'query_log_id': qlog.id, 'simulated': not replay.allow_reexecute}
+    )
+
+    response_base = {
+        'query_log_id': qlog.id,
+        'original_query': qlog.query,
+        'parameters': qlog.parameters,
+        'sandbox': sandbox_result.to_dict(),
+        'simulated': True,
+    }
+
+    if not replay.allow_reexecute:
+        return response_base
+
+    # only admins/super-admins may re-execute
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+        raise HTTPException(status_code=403, detail='Insufficient permissions to re-execute')
+
+    # proceed with actual execution (admin opted in)
+    connection = await secure_execution_service.get_connection(db, connection_id, current_user.tenant_id)
+    if connection is None:
+        raise HTTPException(status_code=404, detail='Connection not found')
+
+    if connection.db_type == 'postgres':
+        connector = db_pool_manager.register_postgres(
+            name=connection.name,
+            host=connection.host,
+            port=connection.port,
+            user=connection.username or 'postgres',
+            password=encryption_service.decrypt(connection.password_encrypted) if connection.password_encrypted else '',
+            database=connection.database_name or 'postgres',
+            ssl=connection.ssl_enabled,
+            tenant_id=current_user.tenant_id or 'global',
+        )
+    elif connection.db_type == 'mysql':
+        connector = db_pool_manager.register_mysql(
+            name=connection.name,
+            host=connection.host,
+            port=connection.port,
+            user=connection.username or 'root',
+            password=encryption_service.decrypt(connection.password_encrypted) if connection.password_encrypted else '',
+            database=connection.database_name or '',
+            ssl=connection.ssl_enabled,
+            tenant_id=current_user.tenant_id or 'global',
+        )
+    elif connection.db_type == 'mongodb':
+        connector = db_pool_manager.register_mongodb(
+            name=connection.name,
+            host=connection.host,
+            port=connection.port,
+            user=connection.username or '',
+            password=encryption_service.decrypt(connection.password_encrypted) if connection.password_encrypted else '',
+            database=connection.database_name or 'admin',
+            tls=connection.ssl_enabled,
+            tenant_id=current_user.tenant_id or 'global',
+        )
+    else:
+        raise HTTPException(status_code=400, detail='Unsupported database type')
+
+    # determine timeout by role
+    try:
+        role_name = current_user.role.name.lower() if hasattr(current_user.role, 'name') else str(current_user.role).lower()
+    except Exception:
+        role_name = 'user'
+    timeout_map = {
+        'super_admin': 60,
+        'admin': 60,
+        'security_analyst': 30,
+        'user': 10,
+    }
+    exec_timeout = timeout_map.get(role_name, 10)
+
+    # perform execution
+    query_start = datetime.utcnow()
+    try:
+        if connection.db_type == 'mongodb':
+            payload = qlog.query
+            # try to interpret as JSON
+            try:
+                if isinstance(payload, str):
+                    payload_obj = json.loads(payload)
+                else:
+                    payload_obj = payload
+            except Exception:
+                payload_obj = payload
+
+            if isinstance(payload_obj, list):
+                        # run explain-like safe aggregate: limit results and prefer read on secondary
+                        safe_pipeline = payload_obj if isinstance(payload_obj, list) else [payload_obj]
+                        # ensure a safe limit exists
+                        if not any('$limit' in str(stage) for stage in safe_pipeline):
+                            safe_pipeline = safe_pipeline + [{'$limit': 100}]
+                        result = await asyncio.wait_for(connector.execute_aggregate(qlog.collection or '', safe_pipeline), timeout=exec_timeout)
+            else:
+                query_doc = payload_obj if isinstance(payload_obj, dict) else {}
+                result = await asyncio.wait_for(connector.execute_find(qlog.collection or '', query_doc, projection=None, limit=200), timeout=exec_timeout)
+        else:
+            params = qlog.parameters or {}
+            result = await asyncio.wait_for(connector.execute_query(qlog.query, params=params, fetch_one=False, fetch_all=True), timeout=exec_timeout)
+
+        execution_time = (datetime.utcnow() - query_start).total_seconds()
+
+        # log the re-execution
+        await log_service.log_query(
+            db,
+            user_id=current_user.id,
+            query=qlog.query,
+            parameters={'connection_id': connection_id, 'params': qlog.parameters or {}},
+            execution_time=execution_time,
+            ip_address=None,
+            blocked=False,
+            block_reason=None,
+            tenant_id=current_user.tenant_id,
+            connection_id=connection_id,
+        )
+
+        await log_service.log_audit(
+            db,
+            user_id=current_user.id,
+            tenant_id=current_user.tenant_id,
+            action='replay_executed',
+            resource='database_connections',
+            details={'connection_id': connection_id, 'query_log_id': qlog.id, 'rows': len(result) if isinstance(result, list) else 1}
+        )
+
+        return {'simulated': False, 'execution_time': execution_time, 'rows': len(result) if isinstance(result, list) else 1, 'results': result}
+
+    except asyncio.TimeoutError:
+        await log_service.log_audit(
+            db,
+            user_id=current_user.id,
+            tenant_id=current_user.tenant_id,
+            action='replay_timeout',
+            resource='database_connections',
+            details={'connection_id': connection_id, 'query_log_id': qlog.id}
+        )
+        raise HTTPException(status_code=504, detail='Replay execution timed out')
+    except Exception as e:
+        await log_service.log_audit(
+            db,
+            user_id=current_user.id,
+            tenant_id=current_user.tenant_id,
+            action='replay_failed',
+            resource='database_connections',
+            details={'connection_id': connection_id, 'query_log_id': qlog.id, 'error': str(e)}
+        )
+        raise HTTPException(status_code=500, detail='Replay execution failed')
+
+
+@router.get('/admin/config')
+async def get_admin_config(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    result = await db.execute(select(GlobalConfig))
+    rows = result.scalars().all()
+    out = {}
+    for r in rows:
+        try:
+            val = r.value
+            if r.encrypted:
+                # decrypt string fields if stored as string
+                if isinstance(val, str):
+                    try:
+                        val = encryption_service.decrypt(val)
+                    except Exception:
+                        pass
+            out[r.key] = {"value": val, "encrypted": r.encrypted, "version": r.version, "updated_at": r.updated_at}
+        except Exception:
+            out[r.key] = {"value": r.value, "encrypted": r.encrypted}
+    return out
+
+
+@router.put('/admin/config')
+async def put_admin_config(items: List[AdminConfigItem], current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    from app.models import GlobalConfig as GC
+
+    updated = []
+    for item in items:
+        stmt = select(GC).where(GC.key == item.key)
+        res = await db.execute(stmt)
+        obj = res.scalar_one_or_none()
+        value_to_store = item.value
+        if item.encrypted:
+            # encrypt JSON as string
+            try:
+                value_to_store = encryption_service.encrypt(item.value)
+            except Exception:
+                value_to_store = item.value
+
+        if obj:
+            obj.value = value_to_store
+            obj.encrypted = item.encrypted
+            obj.version = (obj.version or 1) + 1
+            obj.updated_by = current_user.id
+            db.add(obj)
+            updated.append(item.key)
+        else:
+            new = GC(key=item.key, value=value_to_store, encrypted=item.encrypted, updated_by=current_user.id)
+            db.add(new)
+            updated.append(item.key)
+
+    try:
+        await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail='Failed to persist config')
+
+    await log_service.log_audit(db, user_id=current_user.id, action='update_global_config', resource='global_config', details={'keys': updated})
+
+    return {"updated": updated}
+
+
+@router.post('/auth/logout')
+async def logout(refresh_token: str, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    try:
+        import hashlib
+        from app.models import RefreshToken as RT
+        token_hash = hashlib.sha256(refresh_token.encode('utf-8')).hexdigest()
+        result_rt = await db.execute(select(RT).where(RT.token == token_hash, RT.user_id == current_user.id))
+        rt_obj = result_rt.scalar_one_or_none()
+        if rt_obj:
+            rt_obj.revoked = True
+            db.add(rt_obj)
+            await db.commit()
+            return {"status": "revoked"}
+        else:
+            raise HTTPException(status_code=404, detail="Refresh token not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to revoke token")
+
+
 @router.get("/users/me", response_model=UserResponse)
 async def get_current_user_info(current_user: User = Depends(get_current_user)):
     try:
@@ -297,12 +1259,31 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
         id=current_user.id,
         username=current_user.username,
         email=decrypted_email,
+        phone_number=current_user.phone_number,
         role=current_user.role.value,
         is_active=current_user.is_active,
         is_verified=current_user.is_verified,
         last_login=current_user.last_login,
         created_at=current_user.created_at
     )
+
+
+@router.get("/users/me/settings", response_model=UserSettingsModel)
+async def get_current_user_settings(current_user: User = Depends(get_current_user)):
+    return _merge_user_settings(current_user.settings)
+
+
+@router.put("/users/me/settings", response_model=UserSettingsModel)
+async def update_current_user_settings(
+    payload: UserSettingsModel,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    merged = _merge_user_settings(payload.model_dump())
+    current_user.settings = merged
+    await db.commit()
+    await db.refresh(current_user)
+    return merged
 
 
 @router.get("/users", response_model=List[UserResponse])
@@ -328,6 +1309,7 @@ async def list_users(
             id=u.id,
             username=u.username,
             email="***encrypted***",
+                phone_number=u.phone_number,
             role=u.role.value,
             is_active=u.is_active,
             is_verified=u.is_verified,
@@ -385,6 +1367,7 @@ async def analyze_query(
     request: AttackDetectionRequest,
     db: AsyncSession = Depends(get_db)
 ):
+    sandbox_result = query_sandbox.analyze(request.query)
     result = sql_injection_detector.detect(request.query)
     
     if result.is_malicious:
@@ -416,7 +1399,13 @@ async def analyze_query(
         severity=result.severity.value,
         confidence=result.confidence,
         details=result.details,
-        detection_method=result.detection_method
+        detection_method=result.detection_method,
+        threat_score=sandbox_result.threat_score,
+        risk_level=sandbox_result.risk_level,
+        explanation=sandbox_result.explanation,
+        sandbox_blocked=sandbox_result.blocked,
+        affected_tables=sandbox_result.affected_tables,
+        recommended_action=sandbox_result.recommendation,
     )
 
 
@@ -1032,22 +2021,22 @@ class NotificationSendRequest(BaseModel):
 
 @router.post("/notifications/send")
 async def send_notification(
-    request: NotificationSendRequest,
+    body: NotificationSendRequest,
+    http_request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    # Store notification and optionally send via webhook configured in settings
     from app.models import Notification as NotificationModel
     from app.config import settings
-    import httpx
+    from app.notification import enqueue_notification_delivery
 
     note = NotificationModel(
-        user_id=request.user_id,
-        title=request.title,
-        message=request.message,
-        notification_type=request.notification_type,
+        user_id=body.user_id,
+        title=body.title,
+        message=body.message,
+        notification_type=body.notification_type,
         delivery_status="queued",
-        delivery_target=request.target,
+        delivery_target=body.target,
     )
     db.add(note)
     await db.commit()
@@ -1058,23 +2047,20 @@ async def send_notification(
         user_id=current_user.id,
         action="notification_sent",
         resource="notifications",
-        details={"notification_id": note.id, "user_id": request.user_id}
+        details={"notification_id": note.id, "user_id": body.user_id}
     )
 
-    # Enqueue the delivery job so the worker can retry on failure.
     try:
-        from app.main import app as fastapi_app, enqueue_notification_delivery
-
-        delivery_target = request.target or getattr(settings, "NOTIFICATION_WEBHOOK", None)
+        delivery_target = body.target or getattr(settings, "NOTIFICATION_WEBHOOK", None)
         await enqueue_notification_delivery(
-            fastapi_app,
+            http_request.app,
             note.id,
             {
                 "notification_id": note.id,
-                "title": request.title,
-                "message": request.message,
-                "user_id": request.user_id,
-                "notification_type": request.notification_type,
+                "title": body.title,
+                "message": body.message,
+                "user_id": body.user_id,
+                "notification_type": body.notification_type,
             },
             target=delivery_target,
             max_attempts=4,
@@ -1082,7 +2068,7 @@ async def send_notification(
     except Exception:
         pass
 
-    return {"status": "queued", "id": note.id, "delivery_target": request.target or getattr(settings, "NOTIFICATION_WEBHOOK", None)}
+    return {"status": "queued", "id": note.id, "delivery_target": body.target or getattr(settings, "NOTIFICATION_WEBHOOK", None)}
 
 
 class ActivityItem(BaseModel):
@@ -1154,3 +2140,48 @@ async def get_activity(
     items_sorted = sorted(items, key=lambda x: x.created_at or datetime.utcnow(), reverse=True)
 
     return items_sorted[:limit]
+
+
+@router.post('/admin/config/apply')
+async def apply_admin_config(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    # admin-only
+    if current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    # mark last_applied in global config
+    try:
+        from app.models import GlobalConfig as GC
+        stmt = select(GC).where(GC.key == '__last_applied__')
+        res = await db.execute(stmt)
+        obj = res.scalar_one_or_none()
+        now = datetime.utcnow().isoformat()
+        if obj:
+            obj.value = {'applied_at': now, 'by': current_user.id}
+            obj.version = (obj.version or 1) + 1
+            obj.updated_by = current_user.id
+            db.add(obj)
+        else:
+            new = GC(key='__last_applied__', value={'applied_at': now, 'by': current_user.id}, encrypted=False, updated_by=current_user.id)
+            db.add(new)
+        await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail='Failed to record apply')
+
+    await log_service.log_audit(db, user_id=current_user.id, tenant_id=current_user.tenant_id, action='apply_global_config', resource='global_config', details={'by': current_user.id})
+
+    # Optional remote restart: only if env var ALLOW_REMOTE_RESTART is truthy
+    import os, asyncio
+    allow_restart = os.getenv('ALLOW_REMOTE_RESTART', 'false').lower() in ('1', 'true', 'yes')
+    if allow_restart:
+        async def delayed_exit():
+            await asyncio.sleep(1.0)
+            os._exit(0)
+
+        asyncio.create_task(delayed_exit())
+        return {"status": "applied", "restart": True}
+
+    return {"status": "applied", "restart": False}

@@ -1,28 +1,44 @@
 from datetime import datetime, timedelta
 from typing import Optional, List
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+import bcrypt
 from app.config import settings
 from app.models import User, UserRole
 from app.database import get_db
 from app.encryption import encryption_service
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_PREFIX}/auth/login")
 security = HTTPBearer()
 
 
+def _truncate_bcrypt_password(password: str) -> str:
+    password_bytes = password.encode("utf-8")
+    if len(password_bytes) <= 72:
+        return password
+    return password_bytes[:72].decode("utf-8", errors="ignore")
+
+
+def _bcrypt_bytes(password: str) -> bytes:
+    return _truncate_bcrypt_password(password).encode("utf-8")
+
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        hashed_bytes = hashed_password.encode("utf-8") if isinstance(hashed_password, str) else hashed_password
+        return bcrypt.checkpw(_bcrypt_bytes(plain_password), hashed_bytes)
+    except ValueError:
+        return False
 
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(_bcrypt_bytes(password), salt)
+    return hashed.decode("utf-8")
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -124,6 +140,7 @@ class AuthService:
         username: str,
         email: str,
         password: str,
+        phone_number: Optional[str] = None,
         role: UserRole = UserRole.USER
     ) -> User:
         result = await db.execute(
@@ -145,6 +162,7 @@ class AuthService:
             username=username,
             email=encrypted_email,
             hashed_password=hashed_password,
+            phone_number=phone_number,
             role=role,
             is_active=True,
             is_verified=False
@@ -183,6 +201,11 @@ class AuthService:
     def create_tokens(user: User) -> dict:
         access_token = create_access_token(data={"sub": str(user.id), "role": user.role.value})
         refresh_token = create_refresh_token(data={"sub": str(user.id)})
+
+        try:
+            email = encryption_service.decrypt(user.email)
+        except Exception:
+            email = user.email
         
         return {
             "access_token": access_token,
@@ -191,9 +214,27 @@ class AuthService:
             "user": {
                 "id": user.id,
                 "username": user.username,
+                "email": email,
+                "phone_number": user.phone_number,
                 "role": user.role.value
             }
         }
+
+    @staticmethod
+    async def cleanup_expired_tokens(db: AsyncSession):
+        """Remove expired refresh tokens from the database."""
+        try:
+            from sqlalchemy import delete
+            from app.models import RefreshToken
+            now = datetime.utcnow()
+            # Remove tokens that have expired
+            await db.execute(delete(RefreshToken).where(RefreshToken.expires_at < now))
+            await db.commit()
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
 
 
 auth_service = AuthService()

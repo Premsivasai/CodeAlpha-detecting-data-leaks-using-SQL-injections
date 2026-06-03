@@ -1,6 +1,7 @@
+from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware as FastAPICORSMiddleware
 from contextlib import asynccontextmanager
 import logging
 import asyncio
@@ -14,11 +15,12 @@ from app.routes import router
 from app.capability import capability_manager
 from app.logs import alert_service
 from app.database import AsyncSessionLocal
+from app.notification import enqueue_notification_delivery, notification_delivery_worker
+from app.pubsub import active_websockets, publish_app_event, broadcast_attack, ensure_local_pubsub
 import redis.asyncio as aioredis
 from sqlalchemy import text
 from app.database import engine
 from datetime import timedelta
-import httpx
 
 
 logging.basicConfig(
@@ -27,135 +29,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-
-
-active_websockets = []
-
-
-def ensure_local_pubsub(app):
-    queues = getattr(app.state, 'local_pubsub', None)
-    if queues is None:
-        queues = {
-            'ws:attacks': asyncio.Queue(),
-            'cache:security:invalidate': asyncio.Queue(),
-        }
-        app.state.local_pubsub = queues
-    return queues
-
-
-async def persist_notification_attempt(app, notification_id: int, target: str | None, attempt_number: int, status: str, error_message: str | None = None, response_code: int | None = None, next_attempt_at: datetime | None = None):
-    try:
-        async with AsyncSessionLocal() as db:
-            from app.models import Notification, NotificationDeliveryAttempt
-
-            attempt = NotificationDeliveryAttempt(
-                notification_id=notification_id,
-                target=target,
-                attempt_number=attempt_number,
-                status=status,
-                error_message=error_message,
-                response_code=response_code,
-                next_attempt_at=next_attempt_at,
-                delivered_at=datetime.utcnow() if status == 'delivered' else None,
-            )
-            db.add(attempt)
-
-            note = await db.get(Notification, notification_id)
-            if note:
-                note.delivery_target = target
-                note.delivery_attempts = attempt_number
-                note.delivery_status = status
-                note.last_delivery_error = error_message
-                note.next_retry_at = next_attempt_at
-                if status == 'delivered':
-                    note.delivered_at = datetime.utcnow()
-                await db.commit()
-    except Exception as e:
-        logger.warning(f"Failed to persist notification attempt: {e}")
-
-
-async def process_notification_delivery_job(app, job: dict):
-    notification_id = job.get('notification_id')
-    target = job.get('target')
-    payload = job.get('payload') or {}
-    attempt_number = int(job.get('attempt_number', 1))
-    max_attempts = int(job.get('max_attempts', 3))
-
-    if not target:
-        await persist_notification_attempt(app, notification_id, target, attempt_number, 'skipped')
-        return
-
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            response = await client.post(target, json=payload)
-            if 200 <= response.status_code < 300:
-                await persist_notification_attempt(app, notification_id, target, attempt_number, 'delivered', response_code=response.status_code)
-                return
-
-            raise RuntimeError(f"Webhook returned {response.status_code}")
-    except Exception as exc:
-        error_message = str(exc)
-        next_delay = min(2 ** attempt_number, 60)
-        next_attempt_at = datetime.utcnow() + timedelta(seconds=next_delay)
-        await persist_notification_attempt(app, notification_id, target, attempt_number, 'failed', error_message=error_message, next_attempt_at=next_attempt_at)
-
-        if attempt_number < max_attempts:
-            async def retry_later():
-                await asyncio.sleep(next_delay)
-                retry_job = dict(job)
-                retry_job['attempt_number'] = attempt_number + 1
-                await app.state.notification_delivery_queue.put(retry_job)
-
-            asyncio.create_task(retry_later())
-
-
-async def notification_delivery_worker(app):
-    while True:
-        try:
-            job = await app.state.notification_delivery_queue.get()
-            await process_notification_delivery_job(app, job)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"Notification delivery worker error: {e}")
-            await asyncio.sleep(1)
-
-
-async def enqueue_notification_delivery(app, notification_id: int, payload: dict, target: str | None = None, max_attempts: int = 3):
-    queue = getattr(app.state, 'notification_delivery_queue', None)
-    if queue is None:
-        app.state.notification_delivery_queue = asyncio.Queue()
-        queue = app.state.notification_delivery_queue
-
-    job = {
-        'notification_id': notification_id,
-        'payload': payload,
-        'target': target,
-        'attempt_number': 1,
-        'max_attempts': max_attempts,
-    }
-    await queue.put(job)
-    return job
-
-
-async def publish_app_event(app, channel: str, message):
-    payload = json.dumps(message) if not isinstance(message, str) else message
-
-    redis = getattr(app.state, 'redis', None)
-    if redis is not None:
-        try:
-            await redis.publish(channel, payload)
-            return True
-        except Exception as exc:
-            logger.warning(f"Redis publish failed for {channel}: {exc}")
-
-    queues = ensure_local_pubsub(app)
-    queue = queues.get(channel)
-    if queue is not None:
-        await queue.put(payload)
-        return True
-
-    return False
 
 
 async def refresh_hourly_materialized_view():
@@ -170,7 +43,17 @@ async def refresh_hourly_materialized_view():
 async def periodic_cleanup():
     while True:
         try:
+            # cleanup capability manager data
             capability_manager.cleanup_expired()
+            # cleanup expired refresh tokens
+            try:
+                from app.database import AsyncSessionLocal
+                async with AsyncSessionLocal() as db:
+                    from app.auth import auth_service
+                    await auth_service.cleanup_expired_tokens(db)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup expired tokens: {e}")
+
             logger.info("Periodic cleanup completed")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
@@ -423,14 +306,16 @@ app = FastAPI(
 
 setup_middleware(app)
 
-# Add CORS middleware to allow frontend access
+# Add CORS middleware
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000", "http://127.0.0.1:3001"],
+    FastAPICORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 async def root():
     return {
         "name": settings.PROJECT_NAME,
@@ -445,27 +330,139 @@ async def root():
 
 
 @app.get(f"{settings.API_V1_PREFIX}/health")
-async def health_check():
+async def health_check(request: Request):
+    import psutil
+    import os
+    
+    db_status = "connected"
+    redis_status = "disconnected"
+    
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(text("SELECT 1"))
+    except Exception as e:
+        db_status = f"error: {str(e)[:50]}"
+    
+    redis = getattr(request.app.state, 'redis', None)
+    if redis:
+        try:
+            await redis.ping()
+            redis_status = "connected"
+        except Exception:
+            redis_status = "error"
+    
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
+        "version": settings.VERSION,
+        "uptime_seconds": int((datetime.utcnow() - datetime.fromisoformat(getattr(request.app.state, 'start_time', datetime.utcnow().isoformat()))).total_seconds()),
         "services": {
-            "database": "connected",
+            "database": db_status,
+            "redis": redis_status,
             "encryption": "active",
             "detection": "running",
             "ai_detection": "initialized"
+        },
+        "system": {
+            "memory_rss_mb": round(memory_info.rss / 1024 / 1024, 2),
+            "cpu_percent": process.cpu_percent(),
+            "threads": process.num_threads()
+        }
+    }
+
+
+@app.get(f"{settings.API_V1_PREFIX}/health/detailed")
+async def detailed_health_check(request: Request):
+    import psutil
+    import os
+    import sys
+    
+    db_connected = False
+    db_version = None
+    
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(text("SELECT version()"))
+            db_version = result.scalar()
+            db_connected = True
+    except Exception:
+        pass
+    
+    redis_connected = False
+    redis_info = {}
+    
+    redis = getattr(request.app.state, 'redis', None)
+    if redis:
+        try:
+            await redis.ping()
+            redis_connected = True
+            redis_info = {
+                "keys": await redis.dbsize(),
+            }
+        except Exception:
+            pass
+    
+    ws_stats = {
+        "total_connections": len(active_websockets)
+    }
+    
+    process = psutil.Process(os.getpid())
+    memory = process.memory_info()
+    
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "dependencies": {
+            "postgresql": {
+                "connected": db_connected,
+                "version": db_version.split(" ")[0] if db_version else None,
+                "full_version": db_version[:100] if db_version else None
+            },
+            "redis": {
+                "connected": redis_connected,
+                "info": redis_info
+            }
+        },
+        "application": {
+            "python_version": sys.version.split()[0],
+            "workers": 1,
+            "start_time": getattr(request.app.state, 'start_time', None)
+        },
+        "websocket": ws_stats,
+        "resources": {
+            "memory_mb": round(memory.rss / 1024 / 1024, 2),
+            "cpu_percent": round(process.cpu_percent(), 2),
+            "threads": process.num_threads(),
+            "open_files": len(process.open_files()) if hasattr(process, 'open_files') else 0
         }
     }
 
 
 @app.websocket(f"{settings.API_V1_PREFIX}/ws/attacks")
 async def websocket_attacks(websocket: WebSocket):
-    await websocket.accept()
-    active_websockets.append(websocket)
+    from app.middleware.websocket import handle_websocket_connection, ws_manager
+    
+    connection_id = await handle_websocket_connection(websocket, user_id=None)
+    
+    if not connection_id:
+        return
     
     try:
         while True:
             data = await websocket.receive_text()
+            
+            from app.middleware.websocket import ws_rate_limiter
+            if not await ws_rate_limiter.check_rate_limit(connection_id):
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Rate limit exceeded"
+                })
+                continue
+            
+            ws_manager.connection_metadata[connection_id]["messages_received"] += 1
             
             await websocket.send_json({
                 "type": "heartbeat",
@@ -473,30 +470,14 @@ async def websocket_attacks(websocket: WebSocket):
             })
             
     except WebSocketDisconnect:
-        active_websockets.remove(websocket)
-        logger.info("WebSocket client disconnected")
+        await ws_manager.disconnect(connection_id)
+        logger.info(f"WebSocket client disconnected: {connection_id}")
 
 
-async def broadcast_attack(attack_data: dict):
-    message = {
-        "type": "attack",
-        "data": attack_data,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-    
-    disconnected = []
-    for ws in active_websockets:
-        try:
-            await ws.send_json(message)
-        except:
-            disconnected.append(ws)
-    
-    for ws in disconnected:
-        if ws in active_websockets:
-            active_websockets.remove(ws)
-
+from app.routes.sessions import router as sessions_router
 
 app.include_router(router, prefix=settings.API_V1_PREFIX, tags=["api"])
+app.include_router(sessions_router, prefix=settings.API_V1_PREFIX, tags=["sessions"])
 
 
 @app.post(f"{settings.API_V1_PREFIX}/internal/publish")
@@ -525,6 +506,63 @@ async def internal_enqueue_notification(request: Request):
         return JSONResponse(status_code=400, content={"error": "notification_id required"})
     await enqueue_notification_delivery(app, int(notification_id), payload, target, max_attempts=max_attempts)
     return {"queued": True, "notification_id": notification_id}
+
+
+@app.get(f"{settings.API_V1_PREFIX}/connections/{{connection_id}}/export")
+async def export_connection_logs(connection_id: int, request: Request, start_ts: Optional[str] = None, end_ts: Optional[str] = None):
+    """Export QueryLog entries for a connection as JSON attachment. Admin-only."""
+    from fastapi.responses import StreamingResponse
+    from app.database import AsyncSessionLocal
+    from app.models import QueryLog, UserRole
+
+    current_user = None
+    try:
+        current_user = request.state.user
+    except Exception:
+        pass
+
+    if not current_user or current_user.role not in (UserRole.ADMIN, UserRole.SUPER_ADMIN):
+        raise HTTPException(status_code=403, detail='Insufficient permissions')
+
+    async def stream_logs():
+        async with AsyncSessionLocal() as db:
+            query = select(QueryLog).where(QueryLog.connection_id == connection_id).order_by(QueryLog.timestamp)
+            if start_ts:
+                try:
+                    from datetime import datetime as _dt
+                    start_dt = _dt.fromisoformat(start_ts)
+                    query = query.where(QueryLog.timestamp >= start_dt)
+                except Exception:
+                    pass
+            if end_ts:
+                try:
+                    from datetime import datetime as _dt
+                    end_dt = _dt.fromisoformat(end_ts)
+                    query = query.where(QueryLog.timestamp <= end_dt)
+                except Exception:
+                    pass
+
+            res = await db.stream(query)
+            first = True
+            yield b"["
+            async for row in res.scalars():
+                import orjson
+                if not first:
+                    yield b","  
+                else:
+                    first = False
+                yield orjson.dumps({
+                    'id': row.id,
+                    'query': row.query,
+                    'parameters': row.parameters,
+                    'timestamp': row.timestamp.isoformat() if row.timestamp else None,
+                    'blocked': row.blocked,
+                    'block_reason': row.block_reason,
+                })
+            yield b"]"
+
+    headers = {"Content-Disposition": f"attachment; filename=connection_{connection_id}_logs.json"}
+    return StreamingResponse(stream_logs(), media_type="application/json", headers=headers)
 
 
 @app.exception_handler(Exception)

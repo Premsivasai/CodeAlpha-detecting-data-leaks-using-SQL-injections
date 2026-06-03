@@ -160,9 +160,11 @@ class LogService:
         severity: str,
         detection_method: str,
         blocked: bool = True,
-        metadata: dict = None
+        metadata: dict = None,
+        tenant_id: Optional[int] = None
     ):
         attack_log = AttackLog(
+            tenant_id=tenant_id,
             user_id=user_id,
             ip_address=ip_address,
             attack_type=attack_type,
@@ -180,7 +182,7 @@ class LogService:
 
         # Broadcast the attack to any connected websocket clients (best-effort)
         try:
-            from app.main import broadcast_attack, publish_app_event
+            from app.pubsub import publish_app_event, broadcast_attack
 
             attack_data = {
                 "id": attack_log.id,
@@ -195,20 +197,22 @@ class LogService:
                 "timestamp": attack_log.timestamp.isoformat()
             }
 
-            # Publish through shared app event helper so Redis or local fallback both work
             try:
-                from app.main import app as fastapi_app
-                published = await publish_app_event(fastapi_app, 'ws:attacks', attack_data)
-                if not published:
+                from app.pubsub import publish_app_event
+                import sys
+                fastapi_app = sys.modules.get('app.main').app if 'app.main' in sys.modules else None
+                if fastapi_app:
+                    published = await publish_app_event(fastapi_app, 'ws:attacks', attack_data)
+                    if not published:
+                        await broadcast_attack(attack_data)
+                else:
                     await broadcast_attack(attack_data)
             except Exception:
-                # Best-effort: don't let broadcasting break logging
                 try:
                     await broadcast_attack(attack_data)
                 except Exception:
                     pass
         except Exception:
-            # If broadcast fails for any reason, ignore to not break logging
             pass
 
         # Correlate repeated/high-severity attacks into a synchronous incident.
@@ -219,13 +223,15 @@ class LogService:
 
         # Publish cache invalidation to Redis (best-effort)
         try:
-            from app.main import app as fastapi_app, publish_app_event
-
-            await publish_app_event(
-                fastapi_app,
-                'cache:security:invalidate',
-                {"attack_id": attack_log.id, "timestamp": attack_log.timestamp.isoformat()}
-            )
+            from app.pubsub import publish_app_event
+            import sys
+            fastapi_app = sys.modules.get('app.main').app if 'app.main' in sys.modules else None
+            if fastapi_app:
+                await publish_app_event(
+                    fastapi_app,
+                    'cache:security:invalidate',
+                    {"attack_id": attack_log.id, "timestamp": attack_log.timestamp.isoformat()}
+                )
         except Exception:
             pass
 
@@ -240,9 +246,13 @@ class LogService:
         execution_time: float = None,
         ip_address: str = None,
         blocked: bool = False,
-        block_reason: str = None
+        block_reason: str = None,
+        tenant_id: Optional[int] = None,
+        connection_id: Optional[int] = None
     ):
         query_log = QueryLog(
+            tenant_id=tenant_id,
+            connection_id=connection_id,
             user_id=user_id,
             query=query[:10000],
             parameters=parameters,
@@ -264,10 +274,11 @@ class LogService:
         metadata: dict = None
     ):
         log = EncryptionLog(
+            tenant_id=(metadata or {}).get("tenant_id"),
             operation_type=operation_type,
             data_type=data_type,
             success=success,
-            metadata=metadata
+            meta=metadata
         )
         db.add(log)
         await db.commit()
@@ -308,9 +319,11 @@ class LogService:
         action: str,
         resource: str = None,
         details: dict = None,
-        ip_address: str = None
+        ip_address: str = None,
+        tenant_id: Optional[int] = None
     ):
         audit = AuditLog(
+            tenant_id=tenant_id,
             user_id=user_id,
             action=action,
             resource=resource,
@@ -404,7 +417,7 @@ class AlertService:
             await AlertService._notify_admins(db, title, message, severity)
         
         return alert
-    
+
     @staticmethod
     async def _notify_admins(db: AsyncSession, title: str, message: str, severity: str):
         from app.models import User, UserRole
@@ -449,6 +462,62 @@ class AlertService:
         return alert
 
 
+class SecureExecutionService:
+    @staticmethod
+    async def register_connection(db: AsyncSession, tenant_id: Optional[int], payload, encrypted_password: Optional[str]):
+        from app.models import DatabaseConnection
+
+        connection = DatabaseConnection(
+            tenant_id=tenant_id,
+            name=payload.name,
+            db_type=payload.db_type,
+            host=payload.host,
+            port=payload.port,
+            database_name=payload.database_name,
+            username=payload.username,
+            password_encrypted=encrypted_password,
+            ssl_enabled=payload.ssl_enabled,
+            connection_metadata=payload.metadata or {},
+            status="registered",
+        )
+        db.add(connection)
+        await db.commit()
+        await db.refresh(connection)
+        return connection
+
+    @staticmethod
+    async def list_connections(db: AsyncSession, tenant_id: Optional[int]):
+        from app.models import DatabaseConnection
+
+        query = select(DatabaseConnection)
+        if tenant_id is not None:
+            query = query.where(DatabaseConnection.tenant_id == tenant_id)
+        result = await db.execute(query.order_by(DatabaseConnection.created_at.desc()))
+        return result.scalars().all()
+
+    @staticmethod
+    async def get_connection(db: AsyncSession, connection_id: int, tenant_id: Optional[int]):
+        from app.models import DatabaseConnection
+
+        query = select(DatabaseConnection).where(DatabaseConnection.id == connection_id)
+        if tenant_id is not None:
+            query = query.where(DatabaseConnection.tenant_id == tenant_id)
+        result = await db.execute(query)
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def update_test_status(db: AsyncSession, connection, ok: bool, status: str):
+        connection.last_tested_at = datetime.utcnow()
+        connection.last_test_ok = ok
+        connection.status = status
+        await db.commit()
+        await db.refresh(connection)
+        return connection
+
+
+secure_execution_service = SecureExecutionService()
+
+
 class IPBlocker:
     @staticmethod
     async def block_ip(
@@ -477,24 +546,86 @@ class IPBlocker:
             db.add(blocked)
         
         await db.commit()
+
+        # Cache in Redis for fast checks if available
+        try:
+            from app.main import app as fastapi_app
+            redis = getattr(fastapi_app.state, 'redis', None)
+            if redis:
+                key = f"blockedip:{ip_address}"
+                # compute ttl from expires_at
+                ttl = None
+                if expires_at:
+                    delta = expires_at - datetime.utcnow()
+                    ttl = int(max(0, delta.total_seconds()))
+                # store a minimal payload
+                value = json.dumps({"reason": reason or "", "is_permanent": is_permanent})
+                if ttl and ttl > 0 and not is_permanent:
+                    await redis.set(key, value, ex=ttl)
+                else:
+                    # permanent or no expires -> set without TTL
+                    await redis.set(key, value)
+        except Exception:
+            pass
+
         return existing or blocked
     
     @staticmethod
     async def is_blocked(db: AsyncSession, ip_address: str) -> bool:
+        # Check Redis cache first for quick rejection
+        try:
+            from app.main import app as fastapi_app
+            redis = getattr(fastapi_app.state, 'redis', None)
+            if redis:
+                key = f"blockedip:{ip_address}"
+                cached = await redis.get(key)
+                if cached:
+                    try:
+                        payload = json.loads(cached)
+                        if payload.get('is_permanent'):
+                            return True
+                        return True
+                    except Exception:
+                        return True
+        except Exception:
+            # ignore redis errors and fallback to DB
+            pass
+
         result = await db.execute(
             select(BlockedIP).where(BlockedIP.ip_address == ip_address)
         )
         blocked = result.scalar_one_or_none()
-        
+
         if not blocked:
             return False
-        
+
         if blocked.is_permanent:
+            # ensure redis cache for future
+            try:
+                from app.main import app as fastapi_app
+                redis = getattr(fastapi_app.state, 'redis', None)
+                if redis:
+                    key = f"blockedip:{ip_address}"
+                    await redis.set(key, json.dumps({"reason": blocked.reason or "", "is_permanent": True}))
+            except Exception:
+                pass
             return True
-        
+
         if blocked.expires_at and datetime.utcnow() > blocked.expires_at:
             return False
-        
+
+        # cache until expiration
+        try:
+            from app.main import app as fastapi_app
+            redis = getattr(fastapi_app.state, 'redis', None)
+            if redis and blocked.expires_at:
+                delta = blocked.expires_at - datetime.utcnow()
+                ttl = int(max(0, delta.total_seconds()))
+                key = f"blockedip:{ip_address}"
+                await redis.set(key, json.dumps({"reason": blocked.reason or "", "is_permanent": False}), ex=ttl)
+        except Exception:
+            pass
+
         return True
     
     @staticmethod
@@ -508,6 +639,16 @@ class IPBlocker:
             await db.delete(blocked)
             await db.commit()
         
+        # Remove from Redis cache if present
+        try:
+            from app.main import app as fastapi_app
+            redis = getattr(fastapi_app.state, 'redis', None)
+            if redis:
+                key = f"blockedip:{ip_address}"
+                await redis.delete(key)
+        except Exception:
+            pass
+
         return blocked is not None
 
 

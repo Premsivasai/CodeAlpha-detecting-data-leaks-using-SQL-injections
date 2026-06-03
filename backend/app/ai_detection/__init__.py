@@ -182,6 +182,13 @@ class MLPayloadClassifier:
         self.vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1, 3))
         self.classifier = RandomForestClassifier(n_estimators=100, max_depth=20)
         self.is_trained = False
+        # Attempt to load a persisted model artifact if available
+        from app.config import settings
+        try:
+            self.load_model(settings.AI_MODEL_PATH)
+        except Exception:
+            # model not available at init; remain untrained until explicit training
+            self.is_trained = False
     
     def prepare_dataset(self) -> Tuple[List[str], List[int]]:
         benign_queries = [
@@ -222,17 +229,44 @@ class MLPayloadClassifier:
         X = self.vectorizer.fit_transform(queries)
         self.classifier.fit(X, labels)
         self.is_trained = True
+        try:
+            from app.config import settings
+            self.save_model(settings.AI_MODEL_PATH)
+        except Exception:
+            pass
     
     def predict(self, query: str) -> Tuple[str, float]:
         if not self.is_trained:
-            queries, labels = self.prepare_dataset()
-            self.train(queries, labels)
-        
+            # If model isn't trained or loaded, return benign with low confidence
+            return "benign", 0.5
+
         X = self.vectorizer.transform([query])
         prediction = self.classifier.predict(X)[0]
         probability = self.classifier.predict_proba(X)[0]
-        
-        return "malicious" if prediction == 1 else "benign", max(probability)
+
+        return "malicious" if prediction == 1 else "benign", float(max(probability))
+
+    def save_model(self, path: str):
+        import pickle
+        model_data = {
+            'vectorizer': self.vectorizer,
+            'classifier': self.classifier,
+        }
+        dirpath = os.path.dirname(path)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump(model_data, f)
+
+    def load_model(self, path: str):
+        import pickle
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        with open(path, 'rb') as f:
+            model_data = pickle.load(f)
+            self.vectorizer = model_data.get('vectorizer', self.vectorizer)
+            self.classifier = model_data.get('classifier', self.classifier)
+            self.is_trained = True
 
 
 ai_detector = AIQueryDetector()

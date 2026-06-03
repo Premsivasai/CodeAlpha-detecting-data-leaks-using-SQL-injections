@@ -99,6 +99,12 @@ const Login = () => {
             Register here
           </Link>
         </p>
+        
+        <p style={{ marginTop: '1rem', textAlign: 'center' }}>
+          <Link to="/" style={{ color: 'var(--text-muted)', fontSize: '0.875rem' }}>
+            ← Back to Home
+          </Link>
+        </p>
       </div>
     </div>
   );

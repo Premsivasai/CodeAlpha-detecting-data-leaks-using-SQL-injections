@@ -17,18 +17,111 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+
+  db-replica:
+    image: postgres:15-alpine
+    container_name: secureshield-db-replica
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: secureshield
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command: >
+      postgres -c hot_standby = on
+      -c max_replication_slots = 10
+      -c wal_level = replica
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: secureshield-redis
+    command: redis-server --appendonly yes --requirepass redis_password
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  redis-cluster:
+    image: redis:7-alpine
+    container_name: secureshield-redis-cluster
+    command: >
+      redis-server --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --appendonly yes
+      --requirepass redis_password
+    ports:
+      - "7000:6379"
+    volumes:
+      - redis_cluster_data:/data
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: secureshield-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: secureshield-kafka
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: secureshield-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    restart: unless-stopped
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: secureshield-backend
+    env_file:
+      - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/secureshield
-      SECRET_KEY: 09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7
-      ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-      REDIS_URL: redis://redis:6379/0
-      LOG_LEVEL: INFO
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/secureshield
+      - REDIS_URL=redis://:redis_password@redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - OPENTELEMETRY_ENABLED=true
+      - MULTI_TENANT_ENABLED=true
+      - ZERO_TRUST_ENABLED=true
     ports:
       - "8000:8000"
     depends_on:
@@ -36,6 +129,64 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  ai-inference:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: secureshield-ai-service
+    command: python -m uvicorn app.ai_inference.service:app --host 0.0.0.0 --port 8001
+    environment:
+      - AI_MODEL_PATH=/models/sql_injection_model.pkl
+      - MLFLOW_ENABLED=true
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./models:/models
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: secureshield-celery-worker
+    command: celery -A celery_config worker --loglevel=info --concurrency=2
+    environment:
+      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672/
+      - CELERY_RESULT_BACKEND=redis://:redis_password@redis:6379/1
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/secureshield
+    depends_on:
+      - rabbitmq
+      - redis
+      - db
+    restart: unless-stopped
+
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: secureshield-celery-beat
+    command: celery -A celery_config beat --loglevel=info
+    environment:
+      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672/
+      - CELERY_RESULT_BACKEND=redis://:redis_password@redis:6379/1
+    depends_on:
+      - rabbitmq
+      - redis
     restart: unless-stopped
 
   frontend:
@@ -51,15 +202,99 @@ services:
       - backend
     restart: unless-stopped
 
-  redis:
-    image: redis:7-alpine
-    container_name: secureshield-redis
+  traefik:
+    image: traefik:v3.0
+    container_name: secureshield-traefik
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.email=admin@secureshield.io"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--metrics.prometheus=true"
     ports:
-      - "6379:6379"
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
     volumes:
-      - redis_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_data:/letsencrypt
+      - traefik_logs:/var/log/traefik
     restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: secureshield-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: secureshield-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/secureshield.json
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.48
+    container_name: secureshield-jaeger
+    ports:
+      - "16686:16686"
+      - "6831:6831"
+      - "14268:14268"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - SPAN_STORAGE_TYPE=badger
+    restart: unless-stopped
+
+  kong:
+    image: kong:3.4
+    container_name: secureshield-kong
+    environment:
+      - KONG_DATABASE=off
+      - KONG_DECLARATIVE_CONFIG=/kong/kong.yaml
+      - KONG_PROXY_ACCESS_LOG=/dev/stdout
+      - KONG_ADMIN_ACCESS_LOG=/dev/stdout
+      - KONG_PROXY_ERROR_LOG=/dev/stderr
+      - KONG_ADMIN_ERROR_LOG=/dev/stderr
+    ports:
+      - "8000:8000"
+      - "8443:8443"
+      - "8001:8001"
+    volumes:
+      - ./gateway/kong/kong.yaml:/kong/kong.yaml:ro
+    restart: unless-stopped
+
+networks:
+  default:
+    name: secureshield-network
 
 volumes:
   postgres_data:
+  postgres_replica_data:
   redis_data:
+  redis_cluster_data:
+  rabbitmq_data:
+  kafka_data:
+  zookeeper_data:
+  traefik_data:
+  traefik_logs:
+  prometheus_data:
+  grafana_data:

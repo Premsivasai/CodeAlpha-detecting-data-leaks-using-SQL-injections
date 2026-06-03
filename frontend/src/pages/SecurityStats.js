@@ -9,8 +9,8 @@ import {
   CartesianGrid, 
   Tooltip, 
   ResponsiveContainer,
-  AreaChart,
-  Area
+  LineChart,
+  Line
 } from 'recharts';
 
 const SecurityStats = () => {
@@ -32,25 +32,30 @@ const SecurityStats = () => {
     }
   };
 
-  const mockWeeklyData = [
-    { day: 'Mon', attacks: 45, blocked: 45 },
-    { day: 'Tue', attacks: 52, blocked: 52 },
-    { day: 'Wed', attacks: 38, blocked: 38 },
-    { day: 'Thu', attacks: 67, blocked: 65 },
-    { day: 'Fri', attacks: 42, blocked: 42 },
-    { day: 'Sat', attacks: 28, blocked: 28 },
-    { day: 'Sun', attacks: 21, blocked: 21 },
-  ];
+  const weeklyData = stats?.timeseries?.map((point, index) => {
+    const date = new Date(point.time);
+    return {
+      day: date.toLocaleDateString('en-US', { weekday: 'short', hour: '2-digit' }),
+      attacks: point.attacks || 0,
+      blocked: point.attacks || 0
+    };
+  }) || [];
 
-  const mockTrendData = [
-    { hour: '00:00', score: 85 },
-    { hour: '04:00', score: 92 },
-    { hour: '08:00', score: 78 },
-    { hour: '12:00', score: 65 },
-    { hour: '16:00', score: 72 },
-    { hour: '20:00', score: 88 },
-    { hour: '24:00', score: 95 },
-  ];
+  const trendData = stats?.timeseries?.map((point) => ({
+    time: new Date(point.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    score: Math.max(0, 100 - (point.attacks * 2))
+  })) || [];
+
+  const securityScore = stats 
+    ? Math.max(0, 100 - (stats.attacks_today * 2)) 
+    : 100;
+  
+  const scoreLabel = securityScore > 70 ? 'Good' : securityScore > 40 ? 'Fair' : 'Poor';
+  const scoreColor = securityScore > 70 ? 'var(--accent-success)' : securityScore > 40 ? 'var(--accent-warning)' : 'var(--accent-danger)';
+
+  const detectionRate = stats?.total_attacks_blocked > 0 
+    ? ((stats.total_attacks_blocked - stats.attacks_today) / stats.total_attacks_blocked * 100).toFixed(1)
+    : '100';
 
   if (loading) {
     return (
@@ -66,12 +71,12 @@ const SecurityStats = () => {
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.5rem', marginBottom: '2rem' }}>
         <div className="stat-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--accent-success)', marginBottom: '0.5rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: scoreColor, marginBottom: '0.5rem' }}>
             <Shield size={24} />
             <span>Security Score</span>
           </div>
-          <div className="stat-value" style={{ color: 'var(--accent-success)' }}>92%</div>
-          <div className="stat-label">Excellent</div>
+          <div className="stat-value" style={{ color: scoreColor }}>{securityScore}%</div>
+          <div className="stat-label">{scoreLabel}</div>
         </div>
 
         <div className="stat-card">
@@ -79,7 +84,7 @@ const SecurityStats = () => {
             <TrendingUp size={24} />
             <span>Detection Rate</span>
           </div>
-          <div className="stat-value">99.8%</div>
+          <div className="stat-value">{detectionRate}%</div>
           <div className="stat-label">Last 30 days</div>
         </div>
 
@@ -97,25 +102,31 @@ const SecurityStats = () => {
         <div className="card">
           <div className="card-header" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <BarChart3 size={20} />
-            Weekly Attack Summary
+            Attack Timeline
           </div>
           <div className="chart-container">
-            <ResponsiveContainer width="100%" height={250}>
-              <BarChart data={mockWeeklyData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border-color)" />
-                <XAxis dataKey="day" stroke="var(--text-secondary)" />
-                <YAxis stroke="var(--text-secondary)" />
-                <Tooltip 
-                  contentStyle={{ 
-                    background: 'var(--bg-secondary)', 
-                    border: '1px solid var(--border-color)',
-                    borderRadius: '0.5rem'
-                  }} 
-                />
-                <Bar dataKey="attacks" fill="var(--accent-danger)" name="Attacks" />
-                <Bar dataKey="blocked" fill="var(--accent-success)" name="Blocked" />
-              </BarChart>
-            </ResponsiveContainer>
+            {weeklyData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={250}>
+                <BarChart data={weeklyData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border-color)" />
+                  <XAxis dataKey="day" stroke="var(--text-secondary)" />
+                  <YAxis stroke="var(--text-secondary)" />
+                  <Tooltip 
+                    contentStyle={{ 
+                      background: 'var(--bg-secondary)', 
+                      border: '1px solid var(--border-color)',
+                      borderRadius: '0.5rem'
+                    }} 
+                  />
+                  <Bar dataKey="attacks" fill="var(--accent-danger)" name="Attacks" />
+                  <Bar dataKey="blocked" fill="var(--accent-success)" name="Blocked" />
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '250px', color: 'var(--text-secondary)' }}>
+                No data available
+              </div>
+            )}
           </div>
         </div>
 
@@ -125,27 +136,33 @@ const SecurityStats = () => {
             Security Trend
           </div>
           <div className="chart-container">
-            <ResponsiveContainer width="100%" height={250}>
-              <AreaChart data={mockTrendData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border-color)" />
-                <XAxis dataKey="hour" stroke="var(--text-secondary)" />
-                <YAxis stroke="var(--text-secondary)" domain={[0, 100]} />
-                <Tooltip 
-                  contentStyle={{ 
-                    background: 'var(--bg-secondary)', 
-                    border: '1px solid var(--border-color)',
-                    borderRadius: '0.5rem'
-                  }} 
-                />
-                <Area 
-                  type="monotone" 
-                  dataKey="score" 
-                  stroke="var(--accent-success)" 
-                  fill="rgba(16, 185, 129, 0.2)"
-                  name="Security Score"
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+            {trendData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={250}>
+                <LineChart data={trendData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border-color)" />
+                  <XAxis dataKey="time" stroke="var(--text-secondary)" />
+                  <YAxis stroke="var(--text-secondary)" domain={[0, 100]} />
+                  <Tooltip 
+                    contentStyle={{ 
+                      background: 'var(--bg-secondary)', 
+                      border: '1px solid var(--border-color)',
+                      borderRadius: '0.5rem'
+                    }} 
+                  />
+                  <Line 
+                    type="monotone" 
+                    dataKey="score" 
+                    stroke="var(--accent-success)" 
+                    strokeWidth={2}
+                    name="Security Score"
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '250px', color: 'var(--text-secondary)' }}>
+                No data available
+              </div>
+            )}
           </div>
         </div>
       </div>

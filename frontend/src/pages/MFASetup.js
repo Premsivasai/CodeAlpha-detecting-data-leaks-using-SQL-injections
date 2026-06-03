@@ -19,7 +19,7 @@ const MFASetup = () => {
 
   const verify = async () => {
     try {
-      const res = await api.post('/auth/mfa/verify', { token });
+      await api.post('/auth/mfa/verify', { token });
       setStatus('MFA enabled');
     } catch (e) {
       setStatus('Invalid token');

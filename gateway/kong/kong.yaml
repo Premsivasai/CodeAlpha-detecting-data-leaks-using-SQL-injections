@@ -1,0 +1,132 @@
+_format_version: "3.0"
+
+services:
+  - name: secureshield-backend
+    url: http://secureshield-backend:8000
+    routes:
+      - name: secureshield-api
+        paths:
+          - /api/v1
+        strip_path: false
+        methods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - PATCH
+        plugins:
+          - name: rate-limiting
+            config:
+              minute: 100
+              hour: 1000
+              policy: redis
+              redis_host: secureshield-redis
+              redis_port: 6379
+          - name: cors
+          - name: jwt
+          - name: key-auth
+          - name: ip-restriction
+    plugins:
+      - name: correlation-id
+      - name: request-transformer
+        config:
+          add:
+            headers:
+              - "X-Kong-Upstream-Healthcheck:$(latency_request)"
+
+  - name: secureshield-ai-inference
+    url: http://secureshield-ai-service:8001
+    routes:
+      - name: ai-inference
+        paths:
+          - /ai/v1
+        strip_path: true
+        plugins:
+          - name: rate-limiting
+            config:
+              minute: 50
+              policy: redis
+          - name: cors
+
+  - name: secureshield-websocket
+    url: ws://secureshield-backend:8000
+    routes:
+      - name: websocket-routes
+        paths:
+          - /api/v1/ws
+        strip_path: false
+
+consumers:
+  - username: tenant-admin
+  - username: tenant-user
+  - username: api-client
+
+plugins:
+  - name: rate-limiting
+    config:
+      minute: 60
+      hour: 1000
+      policy: redis
+
+  - name: cors
+    config:
+      origins:
+        - "http://localhost:3000"
+        - "https://app.secureshield.io"
+      methods:
+        - GET
+        - POST
+        - PUT
+        - DELETE
+        - PATCH
+        - OPTIONS
+      headers:
+        - Accept
+        - Authorization
+        - Content-Type
+      exposed_headers:
+        - X-Total-Count
+      credentials: true
+      max_age: 3600
+
+  - name: jwt
+    config:
+      uri_param_names:
+        - jwt
+      header_names:
+        - Authorization
+      claims_to_verify:
+        - exp
+        - iat
+
+  - name: key-auth
+    config:
+      key_names:
+        - X-API-Key
+      key_in_header: true
+
+  - name: ip-restriction
+    config:
+      allow:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+      deny: []
+
+  - name: request-transformer
+    config:
+      rename:
+        headers:
+          - "X-Forwarded-Proto:X-Protocol"
+
+  - name: response-transformer
+    config:
+      add:
+        headers:
+          - "X-Content-Type-Options:nosniff"
+
+jwt_secrets:
+  - consumer: tenant-admin
+    key: "http://secureshield-backend/api/v1/auth/verify"
+    algorithm: HS256
+    rsa_public_key: ""
+    secret: ""

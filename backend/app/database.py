@@ -63,8 +63,57 @@ async def init_db():
             ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMP NULL
         """))
         await conn.execute(text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS settings JSON DEFAULT '{}'::json
+        """))
+        await conn.execute(text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS phone_number VARCHAR(30)
+        """))
+        await conn.execute(text("""
+            ALTER TABLE query_logs
+            ADD COLUMN IF NOT EXISTS tenant_id INTEGER
+        """))
+        await conn.execute(text("""
+            ALTER TABLE query_logs
+            ADD COLUMN IF NOT EXISTS connection_id INTEGER
+        """))
+        await conn.execute(text("""
+            ALTER TABLE encryption_logs
+            ADD COLUMN IF NOT EXISTS tenant_id INTEGER
+        """))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS database_connections (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER REFERENCES tenants(id),
+                name VARCHAR(100) NOT NULL,
+                db_type VARCHAR(20) NOT NULL,
+                host VARCHAR(255) NOT NULL,
+                port INTEGER NOT NULL,
+                database_name VARCHAR(255),
+                username VARCHAR(255),
+                password_encrypted TEXT,
+                ssl_enabled BOOLEAN DEFAULT TRUE,
+                is_active BOOLEAN DEFAULT TRUE,
+                status VARCHAR(50) DEFAULT 'unknown',
+                last_tested_at TIMESTAMP NULL,
+                last_test_ok BOOLEAN,
+                connection_metadata JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        await conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_attack_logs_timestamp
             ON attack_logs (timestamp DESC)
+        """))
+        await conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_database_connections_tenant
+            ON database_connections (tenant_id)
+        """))
+        await conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_query_logs_connection_id
+            ON query_logs (connection_id)
         """))
         await conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_attack_logs_attack_type

@@ -1,0 +1,68 @@
+flowchart LR
+  %% Frontend
+  subgraph Frontend [Frontend]
+    Browser["User Browser / Client"]
+    Navbar["Navbar\n(Profile dropdown)"]
+    Sidebar["Sidebar\n(collapsible rail)"]
+    SettingsPage["Settings Page\n(GET/PUT /users/me/settings)\nTest Connection -> /admin/config/test"]
+    AdminPage["Admin Config UI\n(GET/PUT /admin/config)\nApply & Restart -> /admin/config/apply"]
+  end
+
+  Browser --> Navbar
+  Browser --> Sidebar
+  Browser --> SettingsPage
+  Browser --> AdminPage
+
+  %% Backend
+  subgraph Backend [Backend - FastAPI]
+    API["FastAPI API (/api/v1)"]
+    Auth["Auth Service\n(login, tokens)"]
+    Routes[/"/users/me/settings"\n"/admin/config"\n"/admin/config/test"\n"/admin/config/apply"/]
+    Encrypt["encryption_service\n(AES256)"]
+    LogSvc["log_service / audit_logs"]
+  end
+
+  SettingsPage -->|HTTP| API
+  AdminPage -->|HTTP (admin)| API
+  API --> Routes
+  Routes --> Auth
+  Routes --> Encrypt
+  Routes --> LogSvc
+
+  %% Database
+  subgraph Database [Postgres]
+    UsersTable["users (settings JSON)"]
+    GlobalConfig["global_config (key, value, encrypted, version)"]
+    Audit["audit_logs"]
+  end
+
+  API --> Database
+  Database --> UsersTable
+  Database --> GlobalConfig
+  Database --> Audit
+
+  %% Infra
+  subgraph Infra [Infrastructure]
+    Postgres["Postgres (DATABASE_URL)"]
+    Redis["Redis (REDIS_URL)"]
+    Orchestrator["Orchestrator\n(e.g. docker/k8s)\n(OPTIONAL restart)" ]
+  end
+
+  Database --> Postgres
+  API --> Redis
+  API --> Orchestrator
+
+  %% Flows & Notes
+  classDef note fill:#f8f9fa,stroke:#333,stroke-width:0.5,color:#111,font-size:12px
+  Note1["Test Connection: TCP connect + Redis PING (if redis)\nEndpoint: POST /admin/config/test"]:::note
+  Note2["Apply Flow: PUT /admin/config -> POST /admin/config/apply\nRecords __last_applied__ in GlobalConfig, optional restart only if ALLOW_REMOTE_RESTART env is true"]:::note
+  Note3["User settings = per-user prefs (users.settings)\nGlobalConfig = admin-managed site config (encrypted optional)"]:::note
+
+  AdminPage --- Note1
+  AdminPage --- Note2
+  SettingsPage --- Note3
+
+  style Frontend fill:#0b1220,stroke:#111,color:#e6f0ff
+  style Backend fill:#071229,stroke:#0b3954,color:#e6f0ff
+  style Database fill:#021a2b,stroke:#064a6b,color:#cfeef0
+  style Infra fill:#0b1b1f,stroke:#123, color:#fff

@@ -31,7 +31,7 @@ const Capabilities = () => {
   const generateCapability = async () => {
     setGenerating(true);
     try {
-      const response = await api.post('/capability/generate', newCapability);
+      await api.post('/capability/generate', newCapability);
       fetchCapabilities();
       setNewCapability({
         permissions: ['read:own'],
