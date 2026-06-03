@@ -275,13 +275,3 @@ MIT License - See LICENSE file for details.
 ## Support
 
 For issues and feature requests, please create an issue in the repository.
-
-## Completed Tasks (local workspace)
-
-The project Phase 1 TODOs have been completed in this workspace. Added items include:
-- Incident response endpoints (`POST /api/v1/incidents`, `GET /api/v1/incidents`)
-- Notification storage & webhook sender (`POST /api/v1/notifications/send`)
-- Database `incidents` table and lightweight audit logging
-- Simple unit test for the `Incident` model (`backend/tests/test_incidents.py`)
-
-If you'd like, I can continue by adding a frontend incident dashboard, richer alerting integrations (Slack, PagerDuty), or scheduled materialized view refresh tasks.
